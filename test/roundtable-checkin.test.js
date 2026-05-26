@@ -10,31 +10,35 @@ const {
 } = require("../src/app/roundtable-server");
 const { resolveRoundtableCheckinRange } = require("../src/app/roundtable-checkin");
 
-test("roundtable check-in parser accepts speak JSON", () => {
+test("roundtable check-in parser accepts speak JSON and legacy move JSON", () => {
   assert.deepEqual(
     parseRoundtableCheckinResponse('{"action":"speak","message":"早，用户。我醒了。"}'),
     {
       action: "speak",
       message: "早，用户。我醒了。",
-      reason: "",
+    }
+  );
+  assert.deepEqual(
+    parseRoundtableCheckinResponse('{"action":"move","message":"早，用户。我醒了。"}'),
+    {
+      action: "speak",
+      message: "早，用户。我醒了。",
     }
   );
 });
 
 test("roundtable check-in parser accepts silent and remind_self JSON", () => {
   assert.deepEqual(
-    parseRoundtableCheckinResponse('{"action":"silent","reason":"Claude just replied."}'),
+    parseRoundtableCheckinResponse('{"action":"silent"}'),
     {
       action: "silent",
-      reason: "Claude just replied.",
     }
   );
   assert.deepEqual(
-    parseRoundtableCheckinResponse('{"action":"remind_self","afterMinutes":20,"reason":"see whether Codex answers"}'),
+    parseRoundtableCheckinResponse('{"action":"remind_self","afterMinutes":20}'),
     {
       action: "remind_self",
       afterMinutes: 20,
-      reason: "see whether Codex answers",
     }
   );
   assert.equal(resolveRequestedCheckinDelayMs({ action: "remind_self", afterMinutes: 20 }), 20 * 60_000);
@@ -44,6 +48,15 @@ test("roundtable check-in parser treats non-JSON as a group message", () => {
   assert.deepEqual(parseRoundtableCheckinResponse("我醒了，来看看桌上有什么。"), {
     action: "speak",
     message: "我醒了，来看看桌上有什么。",
+  });
+});
+
+test("roundtable check-in parser never posts control JSON as chat text", () => {
+  assert.deepEqual(parseRoundtableCheckinResponse('{"action":"silent"}'), {
+    action: "silent",
+  });
+  assert.deepEqual(parseRoundtableCheckinResponse('{"action":"silent"'), {
+    action: "silent",
   });
 });
 
@@ -58,14 +71,17 @@ test("roundtable check-in prompt stays compact and includes action choices", () 
       ],
     },
   });
-  assert.match(prompt, /Codex check-in/);
-  assert.match(prompt, /Then reply with exactly one JSON object/);
+  assert.match(prompt, /^check-in/);
+  assert.match(prompt, /Time: \d{4}-\d{2}-\d{2} \d{2}:\d{2} /);
+  assert.match(prompt, /This is your time/);
   assert.match(prompt, /"action":"remind_self"/);
-  assert.match(prompt, /silent` posts nothing to the group/);
-  assert.match(prompt, /visit the forum, browse the web/);
+  assert.match(prompt, /"action":"speak"/);
+  assert.doesNotMatch(prompt, /Current server time/);
+  assert.doesNotMatch(prompt, /Shared task state/);
+  assert.doesNotMatch(prompt, /Topic:/);
   assert.doesNotMatch(prompt, /DeepSeek is not part of automatic check-ins/);
   assert.ok(prompt.length < 950);
-  assert.match(prompt, /User: 早上好/);
+  assert.match(prompt, /Wen: 早上好/);
 });
 
 test("roundtable check-in does not create a runtime thread when none is saved", async () => {
@@ -173,7 +189,7 @@ test("roundtable check-in accepts structured runtime turn results", async () => 
         return {
           threadId: "thread-1",
           turnId: "turn-1",
-          text: '{"action":"silent","reason":"quiet"}',
+          text: '{"action":"silent"}',
         };
       },
     },
@@ -190,11 +206,11 @@ test("roundtable check-in accepts structured runtime turn results", async () => 
 
   const result = await RoundtableServer.prototype.runCheckinSpeaker.call(appLike, "codex");
 
-  assert.deepEqual(result, { action: "silent", reason: "quiet" });
+  assert.deepEqual(result, { action: "silent" });
   assert.deepEqual(applied, [{
     speaker: "codex",
-    action: { action: "silent", reason: "quiet" },
-    rawText: '{"action":"silent","reason":"quiet"}',
+    action: { action: "silent" },
+    rawText: '{"action":"silent"}',
   }]);
 });
 
@@ -217,16 +233,39 @@ test("roundtable runtime prompt sends only unread messages for a speaker", () =>
   const prompt = buildRuntimePrompt({ speaker: "codex", state });
   assert.doesNotMatch(prompt, /旧消息/);
   assert.doesNotMatch(prompt, /旧回复/);
-  assert.match(prompt, /User: 新消息/);
-  assert.match(prompt, /Codex, reply naturally in plain chat text/);
-  assert.match(prompt, /Current server time: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
+  assert.match(prompt, /Wen: 新消息/);
+  assert.match(prompt, /Time: \d{4}-\d{2}-\d{2} \d{2}:\d{2} /);
   assert.doesNotMatch(prompt, /UTC \d{4}-\d{2}-\d{2}T/);
-  assert.match(prompt, /Shared task state:/);
+  assert.doesNotMatch(prompt, /Shared task state:/);
+  assert.match(prompt, /Unread:/);
   assert.doesNotMatch(prompt, /Unread messages since your last turn/);
   assert.doesNotMatch(prompt, /Codex roundtable update/);
   assert.doesNotMatch(prompt, /casual group chat between Codex/);
-  assert.match(prompt, /Topic: 大家好/);
+  assert.doesNotMatch(prompt, /Topic:/);
   assert.doesNotMatch(prompt, /Round:/);
+  assert.doesNotMatch(prompt, /reply naturally in plain chat text/);
+});
+
+test("roundtable opening prompt uses speaker-specific peer mention instructions", () => {
+  const state = {
+    topic: "固定：主厅",
+    round: 0,
+    messages: [
+      { id: "m1", speaker: "user", text: "醒来看到什么" },
+    ],
+    lastSeenMessageIdBySpeaker: {},
+  };
+  const codexPrompt = buildRuntimePrompt({ speaker: "codex", state });
+  assert.match(codexPrompt, /This is a casual group chat between Codex, Claude Code, DeepSeek, Gemini, and Wen\./);
+  assert.match(codexPrompt, /To have Claude Code reply next, mention @Claude\./);
+  assert.match(codexPrompt, /Topic: 主厅/);
+  assert.match(codexPrompt, /Recent transcript:\s+Wen: 醒来看到什么/s);
+  assert.match(codexPrompt, /Codex, reply naturally in plain chat text\./);
+  assert.doesNotMatch(codexPrompt, /Round:/);
+
+  const claudePrompt = buildRuntimePrompt({ speaker: "claude", state });
+  assert.match(claudePrompt, /To have Codex reply next, mention @Codex\./);
+  assert.match(claudePrompt, /Claude Code, reply naturally in plain chat text\./);
 });
 
 test("fresh runtime transcript hides summary injections for other speakers", () => {
@@ -262,7 +301,7 @@ test("fresh runtime transcript hides summary injections for other speakers", () 
   };
 
   const prompt = buildRuntimePrompt({ speaker: "claude", state });
-  assert.match(prompt, /User: shared note/);
+  assert.match(prompt, /Wen: shared note/);
   assert.match(prompt, /Claude-only summary body/);
   assert.doesNotMatch(prompt, /Codex-only summary body/);
 });

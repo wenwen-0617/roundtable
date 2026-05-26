@@ -200,38 +200,39 @@ class RoundtableCheckinPoller {
 function parseRoundtableCheckinResponse(rawText) {
   const text = normalizeText(rawText);
   if (!text) {
-    return { action: "silent", reason: "empty response" };
+    return { action: "silent" };
   }
   const parsed = parseFirstJsonObject(text);
   if (!parsed) {
-    return { action: "speak", message: text };
+    return looksLikeCheckinControl(text)
+      ? { action: "silent" }
+      : { action: "speak", message: text };
   }
   const action = normalizeText(parsed.action).toLowerCase();
   if (action === "silent") {
-    return {
-      action,
-      reason: normalizeText(parsed.reason),
-    };
+    return { action };
   }
   if (action === "remind_self") {
     return {
       action,
       afterMinutes: clampInteger(parsed.afterMinutes, 1, 24 * 60, 30),
-      reason: normalizeText(parsed.reason),
     };
   }
-  if (action === "speak") {
+  if (action === "move" || action === "speak") {
     return {
-      action,
+      action: "speak",
       message: normalizeText(parsed.message) || text,
-      reason: normalizeText(parsed.reason),
     };
   }
-  return {
-    action: "speak",
-    message: normalizeText(parsed.message) || text,
-    reason: normalizeText(parsed.reason),
-  };
+  if (normalizeText(parsed.message)) {
+    return { action: "speak", message: normalizeText(parsed.message) };
+  }
+  return { action: "silent" };
+}
+
+function looksLikeCheckinControl(text) {
+  const normalized = normalizeText(text);
+  return normalized.startsWith("{") || /"action"\s*:/iu.test(normalized);
 }
 
 function resolveRequestedCheckinDelayMs(result = {}) {

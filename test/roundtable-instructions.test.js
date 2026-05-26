@@ -7,7 +7,7 @@ const {
   buildInstructionRefreshText,
 } = require("../src/adapters/runtime/shared-instructions");
 
-test("roundtable instruction wrapper uses configured label and context", () => {
+test("roundtable opening turn includes configured instructions without wrapper", () => {
   const config = {
     sessionInstructionsLabel: "ROUNDTABLE",
     sessionInstructionsContext: "Roundtable Codex discussion",
@@ -16,12 +16,14 @@ test("roundtable instruction wrapper uses configured label and context", () => {
   };
 
   const opening = buildOpeningTurnText(config, "hi");
-  assert.match(opening, /^ROUNDTABLE SESSION INSTRUCTIONS/);
-  assert.match(opening, /stable behavior for this Roundtable Codex discussion/);
+  assert.match(opening, /"name": "cyberboss-roundtable"/);
+  assert.match(opening, /\nhi$/);
+  assert.doesNotMatch(opening, /ROUNDTABLE SESSION INSTRUCTIONS/);
+  assert.doesNotMatch(opening, /Current user message/);
   assert.doesNotMatch(opening, /WECHAT SESSION INSTRUCTIONS/);
 
   const refresh = buildInstructionRefreshText(config);
-  assert.match(refresh, /^ROUNDTABLE SESSION INSTRUCTIONS REFRESH/);
+  assert.match(refresh, /^Re-read and adopt the updated Roundtable Codex discussion instructions/);
   assert.match(refresh, /updated Roundtable Codex discussion instructions/);
-  assert.doesNotMatch(refresh, /WECHAT SESSION INSTRUCTIONS/);
+  assert.doesNotMatch(refresh, /SESSION INSTRUCTIONS/);
 });

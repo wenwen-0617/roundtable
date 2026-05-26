@@ -130,7 +130,7 @@ function speakerLabel(speaker) {
     case "gemini":
       return "Gemini";
     case "user":
-      return "User";
+      return "Wen";
     case "system":
       return "System";
     default:

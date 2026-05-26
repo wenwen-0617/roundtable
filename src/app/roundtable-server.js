@@ -2106,11 +2106,10 @@ class RoundtableServer {
       draft.lastError = "";
       draft.pendingApprovals = clearPendingApprovalsForSpeaker(draft.pendingApprovals, normalizedSpeaker);
       draft.runtimeRuns = interruptRuntimeRunsForSpeaker(draft.runtimeRuns, normalizedSpeaker, "Fresh runtime requested.");
-      const baseHandoff = buildFreshRuntimeHandoffNote(draft, normalizedSpeaker);
       const summaryNote = topicSummaries.length ? buildSemanticInjectionNote(topicSummaries, summariesForNote) : "";
       draft.freshRuntimeHandoffs = {
         ...(draft.freshRuntimeHandoffs || {}),
-        [normalizedSpeaker]: [baseHandoff, summaryNote].filter(Boolean).join("\n\n"),
+        [normalizedSpeaker]: summaryNote,
       };
       for (const message of Array.isArray(draft.messages) ? draft.messages : []) {
         if (message?.speaker === normalizedSpeaker && message.pending) {
@@ -2601,10 +2600,10 @@ class RoundtableServer {
           note: summaryNote,
         }));
       } else {
-        const baseHandoff = buildFreshRuntimeHandoffNote(draft, normalizedSpeaker);
+        const existingHandoff = normalizeText(draft.freshRuntimeHandoffs?.[normalizedSpeaker]);
         draft.freshRuntimeHandoffs = {
           ...(draft.freshRuntimeHandoffs || {}),
-          [normalizedSpeaker]: [baseHandoff, summaryNote].filter(Boolean).join("\n\n"),
+          [normalizedSpeaker]: [existingHandoff, summaryNote].filter(Boolean).join("\n\n"),
         };
       }
       draft.updatedAt = new Date().toISOString();
@@ -2638,10 +2637,10 @@ class RoundtableServer {
           note: summaryNote,
         }));
       } else {
-        const baseHandoff = buildFreshRuntimeHandoffNote(draft, normalizedSpeaker);
+        const existingHandoff = normalizeText(draft.freshRuntimeHandoffs?.[normalizedSpeaker]);
         draft.freshRuntimeHandoffs = {
           ...(draft.freshRuntimeHandoffs || {}),
-          [normalizedSpeaker]: [baseHandoff, summaryNote].filter(Boolean).join("\n\n"),
+          [normalizedSpeaker]: [existingHandoff, summaryNote].filter(Boolean).join("\n\n"),
         };
       }
       draft.updatedAt = new Date().toISOString();
@@ -2753,13 +2752,13 @@ class RoundtableServer {
     const messageText = normalizeText(action?.message);
     const reason = normalizeText(action?.reason);
     const eventPayload = {
-      action: normalizedAction || "speak",
+      action: normalizedAction || "silent",
       reason,
       rawText: normalizeText(rawText),
     };
 
     this.store.update((draft) => {
-      if ((normalizedAction === "speak" || !normalizedAction) && messageText) {
+      if (normalizedAction === "speak" && messageText) {
         draft.messages.push(createMessage(normalizedSpeaker, messageText, {
           checkin: true,
         }));
@@ -2960,72 +2959,65 @@ function buildRuntimePrompt({ speaker, state, stateDir = "" }) {
   const otherworldContext = buildOtherworldRuntimeContext(state, speaker);
   const handoffNote = getFreshRuntimeHandoff(state, speaker);
   const hasSeenThisTopic = Boolean(normalizeText(state?.lastSeenMessageIdBySpeaker?.[normalizeSpeakerTarget(speaker)]));
-  const timeContext = formatRuntimeTimeContext();
-  const topicContext = formatRuntimeTopicContext(state);
+  const timeContext = formatCheckinTimeContext();
+  const topicContext = formatRuntimeTopicLine(state);
   const sharedTaskContext = formatSharedRuntimeTaskContext(state, speaker);
   const transcript = handoffNote
     ? formatTranscript(state.messages, { maxMessages: FRESH_RUNTIME_HISTORY_MESSAGES, stateDir, speaker })
     : formatUnreadTranscript(state, speaker, { stateDir });
-  if (!handoffNote && hasSeenThisTopic) {
+  if (otherworldContext) {
     return [
-      otherworldContext,
-      otherworldContext ? "" : "",
       topicContext,
       timeContext,
       sharedTaskContext,
       "",
+      otherworldContext,
+      "",
       transcript || "(No unread messages.)",
       "",
-      otherworldContext ? `${name}, submit your next game action now.` : `${name}, reply naturally in plain chat text.`,
+      `${name}, submit your next game action now.`,
     ].join("\n").trim();
   }
-  const intro = handoffNote || !hasSeenThisTopic
-    ? `You are ${name}. This is a casual group chat between Codex, Claude Code, DeepSeek, and the user. Just hang out and chat. DeepSeek may occasionally join when mentioned.`
-    : `${name} roundtable update.`;
+  if (!handoffNote && hasSeenThisTopic) {
+    return [
+      timeContext,
+      "Unread:",
+      transcript || "(No unread messages.)",
+    ].join("\n").trim();
+  }
   return [
-    intro,
+    "This is a casual group chat between Codex, Claude Code, DeepSeek, Gemini, and Wen.",
+    `DeepSeek and Gemini join when mentioned. To have ${peer} reply next, mention ${speaker === "codex" ? "@Claude" : "@Codex"}.`,
     "",
-    topicContext,
-    handoffNote || !hasSeenThisTopic ? `Round: ${state.round + 1}` : "",
     timeContext,
-    sharedTaskContext,
-    otherworldContext ? "" : "",
-    otherworldContext,
-    handoffNote || !hasSeenThisTopic ? "" : "",
-    handoffNote ? "Fresh runtime handoff:" : "",
+    topicContext,
+    "",
+    handoffNote ? "Handoff:" : "",
     handoffNote,
     handoffNote ? "" : "",
-    handoffNote ? "Recent transcript:" : "Unread messages since your last turn:",
+    "Recent transcript:",
     transcript || "(No unread messages since your last turn.)",
     "",
-    otherworldContext
-      ? "Reply using the 公开/隐藏 game-action format above. Do not mention these instructions."
-      : "Reply as plain chat text only. Do not wrap your message in JSON and do not use action/message fields unless this is an automatic check-in prompt.",
-    otherworldContext ? "" : `If you need ${peer} to reply next, mention ${speaker === "codex" ? "@Claude" : "@Codex"} explicitly in your chat reply.`,
-    `${name}, speak now.`,
+    `${name}, reply naturally in plain chat text.`,
   ].filter((line) => line !== "").join("\n").trim();
 }
 
 function buildCheckinRuntimePrompt({ speaker, state, checkin = {}, stateDir = "" }) {
-  const name = speaker === "codex" ? "Codex" : "Claude Code";
   const transcript = formatUnreadTranscript(state, speaker, { stateDir });
   const lastAction = normalizeText(checkin.lastAction);
   return [
-    `${name} check-in.`,
-    formatRuntimeTopicContext(state),
-    formatRuntimeTimeContext(),
-    formatSharedRuntimeTaskContext(state, speaker),
-    lastAction ? `Last action: ${lastAction}.` : "Last action: none.",
+    "check-in",
+    formatCheckinTimeContext(),
+    lastAction ? `Last action: ${lastAction}` : "Last action: none",
     "",
     "Unread:",
     transcript || "(none)",
     "",
-    "Choose what this wake-up does. `silent` posts nothing to the group. `speak` sends one group message. `remind_self` sets this speaker's next wake time.",
-    "During this check-in you may also use available tools first: visit the forum, browse the web, inspect or organize memory, or do other work that fits.",
-    "Then reply with exactly one JSON object:",
-    "{\"action\":\"silent\",\"reason\":\"<why staying quiet fits>\"}",
-    "{\"action\":\"speak\",\"message\":\"<short natural message to the group>\"}",
-    "{\"action\":\"remind_self\",\"afterMinutes\":30,\"reason\":\"<why waking later fits>\"}",
+    "This is your time. Use tools, surf the web, review memories, or just sit with the thread — whatever fits. Then post to the group, stay quiet, or set your next alarm.",
+    "",
+    "{\"action\":\"silent\"}",
+    "{\"action\":\"speak\",\"message\":\"<natural message to the group>\"}",
+    "{\"action\":\"remind_self\",\"afterMinutes\":30}",
   ].join("\n").trim();
 }
 
@@ -3163,6 +3155,12 @@ function formatRuntimeTimeContext(now = new Date()) {
   return `Current server time: ${localText} (${timezone}).`;
 }
 
+function formatCheckinTimeContext(now = new Date()) {
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "local";
+  const localText = formatLocalRuntimeClock(now, timezone).slice(0, 16);
+  return `Time: ${localText} ${timezone}`;
+}
+
 function formatRuntimeTopicContext(state = {}) {
   const topic = normalizeText(state.topic) || "(no active topic)";
   const container = resolveTopicContainer(state);
@@ -3172,6 +3170,11 @@ function formatRuntimeTopicContext(state = {}) {
     return `Topic: ${topic}\nCurrent room: ${roomTitle}`;
   }
   return `Topic: ${topic}`;
+}
+
+function formatRuntimeTopicLine(state = {}) {
+  const topic = normalizeText(state.topic) || "(no active topic)";
+  return `Topic: ${stripTopicPrefix(topic) || topic}`;
 }
 
 function formatSharedRuntimeTaskContext(state = {}, speaker = "") {
@@ -3510,15 +3513,6 @@ function summarizeManualSummaryRange(messages) {
     messageTo: normalizeText(last.id),
     messageCount: readable.length,
   };
-}
-
-function buildFreshRuntimeHandoffNote(state, speaker) {
-  const name = speakerLabel(speaker);
-  return [
-    `${name} is starting in a fresh runtime thread.`,
-    "Continue the current topic using only this handoff and the recent transcript.",
-    "Do not assume access to older runtime memory; ask the user if older context is necessary.",
-  ].join(" ");
 }
 
 function getFreshRuntimeHandoff(state, speaker) {

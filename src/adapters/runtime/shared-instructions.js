@@ -6,29 +6,20 @@ function buildOpeningTurnText(config, userText) {
   if (!instructions) {
     return normalizedText;
   }
-  const label = resolveSessionInstructionsLabel(config);
-  const context = resolveSessionInstructionsContext(config);
   return [
-    `${label} SESSION INSTRUCTIONS`,
-    `These instructions define the stable behavior for this ${context}.`,
-    "Do not quote or summarize them back to the user unless explicitly asked.",
-    "",
     instructions,
     "",
-    "Current user message:",
     normalizedText,
   ].join("\n").trim();
 }
 
 function buildInstructionRefreshText(config) {
   const instructions = loadWechatInstructions(config);
-  const label = resolveSessionInstructionsLabel(config);
   const context = resolveSessionInstructionsContext(config);
   if (!instructions) {
     return `Refresh your ${context} behavior for this existing thread. Reply in one short Chinese sentence confirming that you have updated your behavior for this thread.`;
   }
   return [
-    `${label} SESSION INSTRUCTIONS REFRESH`,
     `Re-read and adopt the updated ${context} instructions below for the rest of this existing thread.`,
     "This is an internal refresh command, not a user-facing task.",
     "Do not summarize the instructions back in detail.",
