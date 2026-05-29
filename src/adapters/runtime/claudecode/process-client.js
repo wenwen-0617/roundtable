@@ -91,6 +91,12 @@ class ClaudeCodeProcessClient {
       const text = chunk.toString("utf8").trim();
       if (text) {
         console.error(`[claudecode-runtime] stderr: ${text}`);
+        this.emit({
+          type: "stderr",
+          text,
+          turnId: this.pendingTurnId,
+          sessionId: this.activeThreadId || this.sessionId,
+        }, null);
         if (this.ipcServer && !isPotentiallySensitive(text)) {
           this.ipcServer.broadcast({ type: "stderr", text });
         }
@@ -398,6 +404,7 @@ function buildArgs({ model, permissionMode, disableVerbose, extraArgs, mcpConfig
     "--output-format", "stream-json",
     "--input-format", "stream-json",
     "--permission-prompt-tool", "stdio",
+    "--strict-mcp-config",
   ];
   if (!disableVerbose) {
     args.push("--verbose");
