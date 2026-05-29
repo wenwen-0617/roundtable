@@ -429,6 +429,11 @@ test("roundtable uses turn completion text over longer assistant fragments", () 
       text: "This is a much longer pre-tool fragment that should not win.",
     },
   });
+
+  assert.equal(state.messages[0].text, "This is a much longer pre-tool fragment that should not win.");
+  assert.equal(state.messages[0].pending, false);
+  assert.equal(state.messages[0].runtimeReplyReady, true);
+
   RoundtableServer.prototype.appendSystemEvent.call(appLike, {
     type: "runtime.turn.completed",
     payload: {
@@ -441,6 +446,7 @@ test("roundtable uses turn completion text over longer assistant fragments", () 
 
   assert.equal(state.messages[0].text, "Final answer.");
   assert.equal(state.messages[0].pending, false);
+  assert.equal(state.messages[0].runtimeReplyReady, undefined);
   assert.equal(appLike.pendingMessageByTurnKey.size, 0);
   assert.equal(appLike.pendingMessageBySpeakerTurnKey.size, 0);
 });

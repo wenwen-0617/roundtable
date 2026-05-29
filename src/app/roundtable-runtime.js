@@ -139,6 +139,8 @@ class RuntimeHub {
           accountId: "pwa",
           senderId: speaker,
         },
+        model: speaker === "codex" ? this.config.codexModel : this.config.claudeModel,
+        effort: speaker === "codex" ? this.config.codexReasoningEffort : "",
         accessMode: this.config.codexAccessMode,
         allowCreateThread: !requireExistingThread,
         onTurnStarted: bindTurn,

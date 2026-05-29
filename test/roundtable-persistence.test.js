@@ -239,6 +239,50 @@ test("transient updates stay in memory until explicitly saved", () => {
   assert.equal(new RoundtableStore({ db }).get().messages[0].text, "partial");
 });
 
+test("runtime worklog persists as append-only message timeline", () => {
+  const { db } = createDb();
+  const store = new RoundtableStore({ db });
+  store.replace({
+    id: "topic-1",
+    topic: "runtime worklog",
+    messages: [{ id: "codex-1", speaker: "codex", text: "done", pending: false }],
+  });
+
+  store.upsertRuntimeRun("topic-1", {
+    id: "runtime_turn:codex-1",
+    kind: "runtime_turn",
+    speaker: "codex",
+    status: "completed",
+    phase: "completed",
+    messageId: "codex-1",
+    startedAt: "2026-05-20T06:00:00.000Z",
+    endedAt: "2026-05-20T06:00:02.000Z",
+  });
+  store.appendRuntimeWorklogEvent("topic-1", {
+    runId: "runtime_turn:codex-1",
+    messageId: "codex-1",
+    type: "run.started",
+    title: "Queued",
+    detail: { phase: "queued" },
+    createdAt: "2026-05-20T06:00:01.000Z",
+  });
+  store.appendRuntimeWorklogEvent("topic-1", {
+    runId: "runtime_turn:codex-1",
+    messageId: "codex-1",
+    type: "run.completed",
+    title: "Completed",
+    createdAt: "2026-05-20T06:00:02.000Z",
+  });
+
+  const reloaded = new RoundtableStore({ db });
+  const snapshot = reloaded.runtimeWorklogSnapshot({ topicId: "topic-1" });
+
+  assert.equal(reloaded.get().runtimeRuns[0].id, "runtime_turn:codex-1");
+  assert.equal(snapshot.events.length, 2);
+  assert.equal(snapshot.byMessageId["codex-1"].events[1].type, "run.completed");
+  assert.match(snapshot.byMessageId["codex-1"].summary, /completed/);
+});
+
 test("runtime store closes pending turns when a server restarts", () => {
   const { db } = createDb();
   const first = new RoundtableStore({ db });

@@ -144,6 +144,243 @@ class RoundtableStore {
     }));
   }
 
+  appendMessageToCurrentTopic(message) {
+    if (!this.state.id) {
+      throw new Error("no active topic");
+    }
+    const normalizedMessage = {
+      ...(message || {}),
+      id: normalizeText(message?.id) || `${this.state.id}-message-${Date.now()}`,
+      speaker: normalizeText(message?.speaker) || "user",
+      text: normalizeText(message?.text),
+      attachments: normalizeAttachments(message?.attachments),
+      audioUrl: normalizeText(message?.audioUrl),
+      voiceOnly: Boolean(message?.voiceOnly),
+      pending: Boolean(message?.pending),
+      transcript: message?.transcript === false ? false : true,
+      at: normalizeIsoText(message?.at) || new Date().toISOString(),
+    };
+    const now = new Date().toISOString();
+    this.state.messages = Array.isArray(this.state.messages) ? this.state.messages : [];
+    this.state.messages.push({
+      ...(message || {}),
+      ...normalizedMessage,
+    });
+    this.state.updatedAt = now;
+    runWithSqliteBusyRetry(() => this.appendMessageToCurrentTopicOnce(normalizedMessage, now));
+    return normalizedMessage;
+  }
+
+  appendMessageToCurrentTopicOnce(message, updatedAt) {
+    const topicId = this.state.id;
+    this.db.exec("BEGIN");
+    try {
+      const row = this.db.prepare(
+        "SELECT COALESCE(MAX(ordinal), -1) AS ordinal FROM messages WHERE topic_id = ?"
+      ).get(topicId);
+      const ordinal = Number(row?.ordinal ?? -1) + 1;
+      this.db.prepare(
+        `INSERT INTO messages (
+           id, topic_id, ordinal, speaker, text, attachments_json,
+           audio_url, voice_only, pending, transcript, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        message.id,
+        topicId,
+        ordinal,
+        message.speaker,
+        message.text,
+        JSON.stringify(normalizeAttachments(message.attachments)),
+        message.audioUrl,
+        message.voiceOnly ? 1 : 0,
+        message.pending ? 1 : 0,
+        message.transcript === false ? 0 : 1,
+        message.at,
+      );
+      this.db.prepare("UPDATE topics SET updated_at = ? WHERE id = ?").run(updatedAt, topicId);
+      this.setMeta("updated_at", updatedAt);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  upsertRuntimeRun(topicId, run = {}) {
+    const normalizedTopicId = normalizeText(topicId);
+    const normalizedRun = normalizeRuntimeRunRecord(run);
+    if (!normalizedTopicId || !normalizedRun.id) {
+      return null;
+    }
+    runWithSqliteBusyRetry(() => this.upsertRuntimeRunOnce(normalizedTopicId, normalizedRun));
+    return normalizedRun;
+  }
+
+  upsertRuntimeRunOnce(topicId, run) {
+    const now = new Date().toISOString();
+    this.db.prepare(
+      `INSERT INTO runtime_runs (
+        id, topic_id, message_id, kind, speaker, status, title, phase, detail,
+        thread_id, turn_id, started_at, updated_at, ended_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        topic_id = excluded.topic_id,
+        message_id = CASE WHEN excluded.message_id <> '' THEN excluded.message_id ELSE runtime_runs.message_id END,
+        kind = CASE WHEN excluded.kind <> '' THEN excluded.kind ELSE runtime_runs.kind END,
+        speaker = CASE WHEN excluded.speaker <> '' THEN excluded.speaker ELSE runtime_runs.speaker END,
+        status = CASE WHEN excluded.status <> '' THEN excluded.status ELSE runtime_runs.status END,
+        title = CASE WHEN excluded.title <> '' THEN excluded.title ELSE runtime_runs.title END,
+        phase = CASE WHEN excluded.phase <> '' THEN excluded.phase ELSE runtime_runs.phase END,
+        detail = CASE WHEN excluded.detail <> '' THEN excluded.detail ELSE runtime_runs.detail END,
+        thread_id = CASE WHEN excluded.thread_id <> '' THEN excluded.thread_id ELSE runtime_runs.thread_id END,
+        turn_id = CASE WHEN excluded.turn_id <> '' THEN excluded.turn_id ELSE runtime_runs.turn_id END,
+        started_at = CASE WHEN excluded.started_at <> '' THEN excluded.started_at ELSE runtime_runs.started_at END,
+        updated_at = excluded.updated_at,
+        ended_at = CASE WHEN excluded.ended_at <> '' THEN excluded.ended_at ELSE runtime_runs.ended_at END`
+    ).run(
+      run.id,
+      topicId,
+      run.messageId,
+      run.kind || "runtime_turn",
+      run.speaker,
+      run.status || "running",
+      run.title,
+      run.phase,
+      run.detail,
+      run.threadId,
+      run.turnId,
+      run.startedAt || now,
+      run.updatedAt || now,
+      run.endedAt,
+    );
+  }
+
+  appendRuntimeWorklogEvent(topicId, event = {}) {
+    const normalizedTopicId = normalizeText(topicId);
+    const runId = normalizeText(event.runId);
+    if (!normalizedTopicId || !runId || !normalizeText(event.type)) {
+      return null;
+    }
+    return runWithSqliteBusyRetry(() => this.appendRuntimeWorklogEventOnce(normalizedTopicId, {
+      runId,
+      messageId: normalizeText(event.messageId),
+      type: normalizeText(event.type),
+      level: normalizeText(event.level) || "info",
+      title: normalizeText(event.title),
+      detail: event.detail && typeof event.detail === "object" ? event.detail : {},
+      createdAt: normalizeIsoText(event.createdAt) || new Date().toISOString(),
+    }));
+  }
+
+  appendRuntimeWorklogEventOnce(topicId, event) {
+    const row = this.db.prepare(
+      "SELECT COALESCE(MAX(seq), 0) AS seq FROM runtime_worklog_events WHERE run_id = ?"
+    ).get(event.runId);
+    const seq = Number(row?.seq || 0) + 1;
+    const result = this.db.prepare(
+      `INSERT INTO runtime_worklog_events (
+        run_id, topic_id, message_id, seq, type, level, title, detail_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      event.runId,
+      topicId,
+      event.messageId,
+      seq,
+      event.type,
+      event.level,
+      event.title,
+      JSON.stringify(event.detail || {}),
+      event.createdAt,
+    );
+    return {
+      id: Number(result.lastInsertRowid || 0),
+      seq,
+      ...event,
+      topicId,
+    };
+  }
+
+  appendTopicEvent(topicId, event = {}) {
+    const normalizedTopicId = normalizeText(topicId);
+    const type = normalizeText(event.type);
+    if (!normalizedTopicId || !type) {
+      return null;
+    }
+    return runWithSqliteBusyRetry(() => this.appendTopicEventOnce(normalizedTopicId, {
+      type,
+      payload: event.payload && typeof event.payload === "object" ? event.payload : {},
+      at: normalizeIsoText(event.at) || new Date().toISOString(),
+    }));
+  }
+
+  appendTopicEventOnce(topicId, event) {
+    const row = this.db.prepare(
+      "SELECT COALESCE(MAX(ordinal), -1) AS ordinal FROM events WHERE topic_id = ?"
+    ).get(topicId);
+    const ordinal = Number(row?.ordinal ?? -1) + 1;
+    this.db.prepare(
+      `INSERT INTO events (topic_id, ordinal, type, payload_json, created_at)
+       VALUES (?, ?, ?, ?, ?)`
+    ).run(topicId, ordinal, event.type, JSON.stringify(event.payload || {}), event.at);
+    return { ...event, topicId, ordinal };
+  }
+
+  runtimeWorklogSnapshot({ topicId = "", afterId = 0, limit = 200, lightweight = false, scope = "current", days = 7 } = {}) {
+    const normalizedTopicId = normalizeText(topicId);
+    const allTopics = normalizeText(scope) === "all";
+    if (!normalizedTopicId && !allTopics) {
+      return { runs: [], events: [], byMessageId: {} };
+    }
+    const maxEvents = clampInteger(limit, 1, 1000, 200);
+    const minId = clampInteger(afterId, 0, Number.MAX_SAFE_INTEGER, 0);
+    const dayCount = clampInteger(days, 1, 365, 7);
+    const since = new Date(Date.now() - (dayCount - 1) * 24 * 60 * 60 * 1000);
+    since.setHours(0, 0, 0, 0);
+    const runRows = allTopics
+      ? this.db.prepare(
+        `SELECT runtime_runs.*, topics.title AS topic_title
+         FROM runtime_runs
+         LEFT JOIN topics ON topics.id = runtime_runs.topic_id
+         WHERE COALESCE(runtime_runs.updated_at, runtime_runs.started_at, '') >= ?
+         ORDER BY runtime_runs.updated_at DESC, runtime_runs.started_at DESC
+         LIMIT 160`
+      ).all(since.toISOString())
+      : this.db.prepare(
+        `SELECT runtime_runs.*, topics.title AS topic_title
+         FROM runtime_runs
+         LEFT JOIN topics ON topics.id = runtime_runs.topic_id
+         WHERE runtime_runs.topic_id = ?
+         ORDER BY runtime_runs.updated_at DESC, runtime_runs.started_at DESC
+         LIMIT 80`
+      ).all(normalizedTopicId);
+    const eventRows = allTopics
+      ? this.db.prepare(
+        `SELECT runtime_worklog_events.*, topics.title AS topic_title
+         FROM runtime_worklog_events
+         LEFT JOIN topics ON topics.id = runtime_worklog_events.topic_id
+         WHERE runtime_worklog_events.id > ?
+           AND runtime_worklog_events.created_at >= ?
+         ORDER BY runtime_worklog_events.id
+         LIMIT ?`
+      ).all(minId, since.toISOString(), maxEvents)
+      : this.db.prepare(
+        `SELECT runtime_worklog_events.*, topics.title AS topic_title
+         FROM runtime_worklog_events
+         LEFT JOIN topics ON topics.id = runtime_worklog_events.topic_id
+         WHERE runtime_worklog_events.topic_id = ? AND runtime_worklog_events.id > ?
+         ORDER BY runtime_worklog_events.id
+         LIMIT ?`
+      ).all(normalizedTopicId, minId, maxEvents);
+    const runs = runRows.map(mapRuntimeRunRow);
+    const events = eventRows.map(mapRuntimeWorklogEventRow);
+    const visibleEvents = lightweight ? events.map(compactRuntimeWorklogEventForUi) : events;
+    return {
+      runs,
+      events: visibleEvents,
+      byMessageId: buildRuntimeWorklogByMessage(runs, visibleEvents),
+    };
+  }
+
   searchMessages({ query = "", limit = 10, contextSize = 3, scope = "global", project = "", topicId = "" } = {}) {
     const q = normalizeText(query).toLowerCase();
     const resolvedScope = resolveSearchScope(this.db, { scope, project, topicId });
@@ -238,6 +475,12 @@ class RoundtableStore {
     ).all(topicId)) {
       lastSeenMessageIdBySpeaker[speakerState.speaker] = speakerState.last_seen_message_id;
     }
+    const runtimeRuns = this.db.prepare(
+      `SELECT * FROM runtime_runs
+       WHERE topic_id = ?
+       ORDER BY updated_at ASC, started_at ASC
+       LIMIT 80`
+    ).all(topicId).map(mapRuntimeRunRow);
     return normalizeTopicRecord({
       id: row.id,
       topic: row.title,
@@ -255,6 +498,7 @@ class RoundtableStore {
       freshRuntimeHandoffs: parseJson(row.fresh_runtime_handoffs_json, {}),
       lastSeenMessageIdBySpeaker,
       pendingApprovals,
+      runtimeRuns,
       messages,
       events,
       createdAt: row.created_at,
@@ -374,6 +618,9 @@ class RoundtableStore {
       if (normalizeText(lastSeenMessageId)) {
         insertSpeakerState.run(normalized.id, speaker, normalizeText(lastSeenMessageId));
       }
+    }
+    for (const run of normalizeRuntimeRunListForStore(normalized.runtimeRuns)) {
+      this.upsertRuntimeRunOnce(normalized.id, run);
     }
   }
 
@@ -701,6 +948,124 @@ function parseJson(value, fallback) {
   } catch {
     return fallback;
   }
+}
+
+function normalizeRuntimeRunRecord(run = {}) {
+  return {
+    id: normalizeText(run.id),
+    kind: normalizeText(run.kind),
+    speaker: normalizeText(run.speaker),
+    status: normalizeText(run.status),
+    title: normalizeText(run.title),
+    phase: normalizeText(run.phase),
+    detail: normalizeText(run.detail),
+    messageId: normalizeText(run.messageId),
+    threadId: normalizeText(run.threadId),
+    turnId: normalizeText(run.turnId),
+    startedAt: normalizeIsoText(run.startedAt),
+    updatedAt: normalizeIsoText(run.updatedAt),
+    endedAt: normalizeIsoText(run.endedAt),
+  };
+}
+
+function normalizeRuntimeRunListForStore(value) {
+  return (Array.isArray(value) ? value : [])
+    .map(normalizeRuntimeRunRecord)
+    .filter((run) => run.id);
+}
+
+function mapRuntimeRunRow(row = {}) {
+  const run = normalizeRuntimeRunRecord({
+    id: row.id,
+    kind: row.kind,
+    speaker: row.speaker,
+    status: row.status,
+    title: row.title,
+    phase: row.phase,
+    detail: row.detail,
+    messageId: row.message_id,
+    threadId: row.thread_id,
+    turnId: row.turn_id,
+    startedAt: row.started_at,
+    updatedAt: row.updated_at,
+    endedAt: row.ended_at,
+  });
+  return {
+    ...run,
+    topicId: normalizeText(row.topic_id),
+    topicTitle: normalizeText(row.topic_title),
+  };
+}
+
+function mapRuntimeWorklogEventRow(row = {}) {
+  return {
+    id: Number(row.id || 0),
+    runId: normalizeText(row.run_id),
+    topicId: normalizeText(row.topic_id),
+    messageId: normalizeText(row.message_id),
+    seq: Number(row.seq || 0),
+    type: normalizeText(row.type),
+    level: normalizeText(row.level) || "info",
+    title: normalizeText(row.title),
+    detail: parseJson(row.detail_json, {}),
+    createdAt: normalizeIsoText(row.created_at),
+    topicTitle: normalizeText(row.topic_title),
+  };
+}
+
+function compactRuntimeWorklogEventForUi(event = {}) {
+  const detail = event.detail && typeof event.detail === "object" ? event.detail : {};
+  const compact = Object.fromEntries(
+    Object.entries(detail).filter(([key]) => ![
+      "prompt",
+      "messages",
+      "attachments",
+      "input",
+      "output",
+      "text",
+    ].includes(key))
+  );
+  // Keep a capped thinking text so the per-message worklog popup can show it
+  // inline without pulling the full (heavy) worklog snapshot.
+  if (event.type === "thinking.updated" && typeof detail.text === "string" && detail.text.trim()) {
+    compact.text = detail.text.length > 600 ? `${detail.text.slice(0, 600)}…` : detail.text;
+  }
+  return { ...event, detail: compact };
+}
+
+function buildRuntimeWorklogByMessage(runs = [], events = []) {
+  const byRunId = new Map();
+  for (const event of events) {
+    if (!event.runId) continue;
+    const list = byRunId.get(event.runId) || [];
+    list.push(event);
+    byRunId.set(event.runId, list);
+  }
+  const byMessageId = {};
+  for (const run of runs) {
+    if (!run.messageId) continue;
+    const runEvents = byRunId.get(run.id) || [];
+    byMessageId[run.messageId] = {
+      run,
+      events: runEvents,
+      summary: summarizeRuntimeWorklog(run, runEvents),
+    };
+  }
+  return byMessageId;
+}
+
+function summarizeRuntimeWorklog(run = {}, events = []) {
+  const toolCount = events.filter((event) => event.type === "tool.started").length;
+  const approvalCount = events.filter((event) => event.type === "approval.requested").length;
+  const latest = events.at(-1);
+  const parts = [
+    normalizeText(run.status) || "running",
+    normalizeText(run.phase),
+  ];
+  if (toolCount) parts.push(`${toolCount} tool${toolCount === 1 ? "" : "s"}`);
+  if (approvalCount) parts.push(`${approvalCount} approval${approvalCount === 1 ? "" : "s"}`);
+  if (latest?.title) parts.push(latest.title);
+  return parts.filter(Boolean).join(" | ");
 }
 
 function runWithSqliteBusyRetry(operation) {

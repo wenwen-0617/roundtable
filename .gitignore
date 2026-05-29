@@ -5,6 +5,7 @@
 node_modules/
 coverage/
 *.log
+.tmp/
 
 .cyberboss-roundtable/
 .codex/

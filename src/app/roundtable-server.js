@@ -483,6 +483,17 @@ class RoundtableServer {
       return;
     }
 
+    if (req.method === "GET" && requestUrl.pathname === "/api/runtime/worklog") {
+      const state = this.store.snapshot();
+      const topicId = requestUrl.searchParams.get("topicId") || state.id || "";
+      const afterId = Number(requestUrl.searchParams.get("afterId") || requestUrl.searchParams.get("afterSeq") || 0);
+      const limit = Number(requestUrl.searchParams.get("limit") || 200);
+      const scope = requestUrl.searchParams.get("scope") || "current";
+      const days = Number(requestUrl.searchParams.get("days") || 7);
+      this.sendJson(res, 200, this.store.runtimeWorklogSnapshot({ topicId, afterId, limit, scope, days }));
+      return;
+    }
+
     if (req.method === "GET" && requestUrl.pathname === "/api/storage") {
       this.sendJson(res, 200, this.storageStore.list());
       return;
@@ -644,25 +655,21 @@ class RoundtableServer {
       case "/api/user":
         if (this.isOtherworldRoomActive()) {
           this.addOtherworldUserMessage(body);
-          this.sendJson(res, 202, this.snapshot());
+          this.sendJson(res, 202, { ok: true });
           return;
         }
         this.addUserMessage(body);
-        {
-          const replyBody = withResolvedReplyTarget(body);
-          this.maybeRunTargetedReply(replyBody);
-          this.maybeRunGroupReplies(replyBody);
-        }
-        this.sendJson(res, 202, this.snapshot());
+        this.sendJson(res, 202, { ok: true });
+        this.scheduleReplies(body);
         return;
       case "/api/user-only":
         if (this.isOtherworldRoomActive()) {
           this.addOtherworldUserMessage(body);
-          this.sendJson(res, 202, this.snapshot());
+          this.sendJson(res, 202, { ok: true });
           return;
         }
         this.addUserMessage({ ...body, noReply: true });
-        this.sendJson(res, 202, this.snapshot());
+        this.sendJson(res, 202, { ok: true });
         return;
       case "/api/message/delete":
         this.deleteMessage(body);
@@ -769,11 +776,19 @@ class RoundtableServer {
 
   snapshot() {
     const state = this.store.snapshot();
+    const runtimeWorklog = state.id ? this.store.runtimeWorklogSnapshot({ topicId: state.id, lightweight: true }) : {
+      runs: [],
+      events: [],
+      byMessageId: {},
+    };
+    const messages = attachRuntimeWorklogToMessages(state.messages, runtimeWorklog.byMessageId);
+    const stateWithWorklogMessages = { ...state, messages };
     return {
-      ...state,
+      ...stateWithWorklogMessages,
       checkins: this.checkinStore.snapshot(),
       summaries: state.id ? this.summaryStore.list({ topicId: state.id }) : [],
-      runtimeStatus: buildRuntimeStatus(state),
+      runtimeWorklog,
+      runtimeStatus: buildRuntimeStatus(stateWithWorklogMessages),
     };
   }
 
@@ -1672,11 +1687,22 @@ class RoundtableServer {
     }
     const interrupt = Boolean(body.interrupt);
     const wasRunning = Boolean(state.running);
+    const message = createMessage("user", text, {
+      attachments,
+      supplemental: wasRunning && !interrupt,
+    });
     if (interrupt) {
       if (typeof this.cancelRuntimeRuns === "function") {
         this.cancelRuntimeRuns(state.runtimeRuns);
       }
       clearPendingMessageTurnBindingsForAll(this);
+    }
+    if (!interrupt && typeof this.store.appendMessageToCurrentTopic === "function") {
+      this.store.appendMessageToCurrentTopic(message);
+      if (!wasRunning) {
+        this.autoRunToken += 1;
+      }
+      return;
     }
     this.store.update((draft) => {
       if (interrupt) {
@@ -1685,10 +1711,7 @@ class RoundtableServer {
         draft.running = false;
         draft.status = "paused";
       }
-      draft.messages.push(createMessage("user", text, {
-        attachments,
-        supplemental: wasRunning && !interrupt,
-      }));
+      draft.messages.push(message);
       draft.updatedAt = new Date().toISOString();
       return draft;
     });
@@ -1917,6 +1940,23 @@ class RoundtableServer {
         draft.lastError = formatError(error);
         return draft;
       });
+    });
+  }
+
+  scheduleReplies(body = {}) {
+    const replyBody = withResolvedReplyTarget(body);
+    setImmediate(() => {
+      try {
+        this.maybeRunTargetedReply(replyBody);
+        this.maybeRunGroupReplies(replyBody);
+      } catch (error) {
+        this.store.update((draft) => {
+          draft.running = false;
+          draft.status = "error";
+          draft.lastError = formatError(error);
+          return draft;
+        }, { silentIfEmpty: true });
+      }
     });
   }
 
@@ -2290,6 +2330,11 @@ class RoundtableServer {
       });
       return draft;
     });
+    this.persistRuntimeRunStart(state.id, runtimeRunId, {
+      type: "run.started",
+      title: "Queued",
+      detail: { phase: "queued", speaker },
+    });
 
     try {
       let text;
@@ -2311,15 +2356,27 @@ class RoundtableServer {
         text = await callGemini({ messages, apiKey });
       } else {
         const runtimeState = this.store.get();
+        const runtimePrompt = buildRuntimePrompt({
+          speaker,
+          state: runtimeState,
+          stateDir: this.config?.stateDir || "",
+        });
+        const runtimeAttachments = resolveRuntimeAttachments(runtimeState, speaker, this.config?.stateDir || "");
+        this.persistRuntimeRunStart(state.id, runtimeRunId, {
+          type: "input.captured",
+          title: "Runtime input captured",
+          detail: buildRuntimeInputWorklogDetail({
+            speaker,
+            state: runtimeState,
+            prompt: runtimePrompt,
+            attachments: runtimeAttachments,
+          }),
+        });
         text = resolveRuntimeTurnText(await this.runtimeHub.sendTurn({
           speaker,
           topicId: state.id,
-          text: buildRuntimePrompt({
-            speaker,
-            state: runtimeState,
-            stateDir: this.config?.stateDir || "",
-          }),
-          attachments: resolveRuntimeAttachments(runtimeState, speaker, this.config?.stateDir || ""),
+          text: runtimePrompt,
+          attachments: runtimeAttachments,
           onTurnStarted: (turn) => {
             this.registerPendingMessageTurn(turn, pendingMessageId);
             this.store.update((draft) => {
@@ -2391,6 +2448,11 @@ class RoundtableServer {
         draft.updatedAt = new Date().toISOString();
         return draft;
       });
+      this.persistRuntimeRunStart(state.id, runtimeRunId, {
+        type: "run.completed",
+        title: "Completed",
+        detail: { chars: normalizeText(finalText).length },
+      });
       if (speaker === "codex" || speaker === "claude") {
         await this.runOtherworldAiAction({ speaker, finalText: normalizeText(text) || streamedText });
       }
@@ -2424,6 +2486,12 @@ class RoundtableServer {
         draft.status = "error";
         draft.lastError = formatError(error);
         return draft;
+      });
+      this.persistRuntimeRunStart(state.id, runtimeRunId, {
+        type: "run.failed",
+        level: "error",
+        title: "Failed",
+        detail: { error: formatError(error) },
       });
       throw error;
     }
@@ -2808,24 +2876,41 @@ class RoundtableServer {
       ? this.handleRuntimeApprovalRequest(event)
       : null;
     const isStreamingDelta = event.type === "runtime.reply.delta";
+    const shouldPersistState = runtimeEventNeedsStateSave(event.type);
     const updateEvent = isStreamingDelta
       ? this.store.updateTransient.bind(this.store)
-      : this.store.update.bind(this.store);
+      : shouldPersistState
+      ? this.store.update.bind(this.store)
+      : this.store.updateTransient.bind(this.store);
+    const topicIdBeforeUpdate = this.store.get().id;
     updateEvent((draft) => {
       draft.events = Array.isArray(draft.events) ? draft.events : [];
-      draft.events.push({
-        type: event.type,
-        payload: event.payload || {},
-        at: new Date().toISOString(),
-      });
+      if (!isStreamingDelta) {
+        draft.events.push({
+          type: event.type,
+          payload: event.payload || {},
+          at: new Date().toISOString(),
+        });
+      }
       draft.runtimeRuns = touchRuntimeRunsForEvent(draft.runtimeRuns, event);
       if (approvalAction?.pendingApproval) {
         draft.pendingApprovals = upsertPendingApproval(draft.pendingApprovals, approvalAction.pendingApproval);
         draft.status = "waiting approval";
       }
-      draft.events = draft.events.slice(-80);
+      if (!isStreamingDelta) {
+        draft.events = draft.events.slice(-80);
+      }
       return draft;
     }, { silentIfEmpty: true });
+    if (!isStreamingDelta && !shouldPersistState && typeof this.store.appendTopicEvent === "function") {
+      this.store.appendTopicEvent(topicIdBeforeUpdate, {
+        type: event.type,
+        payload: event.payload || {},
+      });
+    }
+    if (!isStreamingDelta) {
+      this.persistRuntimeEvent(event, { topicId: topicIdBeforeUpdate });
+    }
 
     const payload = event.payload || {};
     const turnKey = buildTurnKey(payload.threadId, payload.turnId);
@@ -2835,7 +2920,11 @@ class RoundtableServer {
     if (!pending) {
       return;
     }
-    if (!isPendingMessage(this.store.get(), pending.messageId)) {
+    const currentPendingMessage = findMessage(this.store.get(), pending.messageId);
+    const canStillReceiveRuntimeText = Boolean(
+      currentPendingMessage?.pending || currentPendingMessage?.runtimeReplyReady
+    );
+    if (!canStillReceiveRuntimeText) {
       if (turnKey) {
         this.pendingMessageByTurnKey.delete(turnKey);
       }
@@ -2853,16 +2942,20 @@ class RoundtableServer {
       }, { silentIfEmpty: true });
     }
     if (event.type === "runtime.reply.completed" && payload.text) {
-      this.store.update((draft) => {
-        if (isPendingMessage(draft, pending.messageId)) {
-          setMessageTextIfLonger(draft, pending.messageId, payload.text);
+      this.store.updateTransient((draft) => {
+        const message = findMessage(draft, pending.messageId);
+        if (message?.pending || message?.runtimeReplyReady) {
+          setMessageTextIfLonger(draft, pending.messageId, payload.text, {
+            pending: false,
+            runtimeReplyReady: true,
+          });
         }
         return draft;
       }, { silentIfEmpty: true });
     }
     if (event.type === "runtime.turn.completed" || event.type === "runtime.turn.failed") {
       this.store.update((draft) => {
-        if (isPendingMessage(draft, pending.messageId)) {
+        if (findMessage(draft, pending.messageId)) {
           finishPendingMessage(draft, pending.messageId, payload.text || "", {
             preferFallback: event.type === "runtime.turn.completed",
           });
@@ -2877,6 +2970,51 @@ class RoundtableServer {
         this.pendingMessageBySpeakerTurnKey.delete(speakerTurnKey);
       }
     }
+  }
+
+  persistRuntimeRunStart(topicId, runId, event = {}) {
+    const run = findRuntimeRun(this.store.get().runtimeRuns, runId);
+    if (!run) {
+      return;
+    }
+    if (typeof this.store.upsertRuntimeRun !== "function"
+      || typeof this.store.appendRuntimeWorklogEvent !== "function") {
+      return;
+    }
+    this.store.upsertRuntimeRun(topicId, run);
+    const type = normalizeText(event.type) || "run.started";
+    const snapshot = typeof this.store.runtimeWorklogSnapshot === "function"
+      ? this.store.runtimeWorklogSnapshot({ topicId, limit: 1000 })
+      : { events: [] };
+    if ((snapshot.events || []).some((item) => item.runId === run.id && item.type === type)) {
+      return;
+    }
+    this.store.appendRuntimeWorklogEvent(topicId, {
+      runId: run.id,
+      messageId: run.messageId,
+      type,
+      level: normalizeText(event.level) || "info",
+      title: normalizeText(event.title) || "Started",
+      detail: event.detail && typeof event.detail === "object" ? event.detail : {},
+    });
+  }
+
+  persistRuntimeEvent(event, { topicId = "" } = {}) {
+    const state = this.store.get();
+    const run = findRuntimeRunForEvent(state.runtimeRuns, event);
+    if (!run) {
+      return;
+    }
+    if (typeof this.store.upsertRuntimeRun !== "function"
+      || typeof this.store.appendRuntimeWorklogEvent !== "function") {
+      return;
+    }
+    this.store.upsertRuntimeRun(topicId || state.id, run);
+    const worklogEvent = runtimeWorklogEventForRuntimeEvent(run, event);
+    if (!worklogEvent) {
+      return;
+    }
+    this.store.appendRuntimeWorklogEvent(topicId || state.id, worklogEvent);
   }
 
   handleRuntimeApprovalRequest(event) {
@@ -3149,6 +3287,17 @@ function buildRuntimeStatus(state = {}) {
   };
 }
 
+function attachRuntimeWorklogToMessages(messages = [], byMessageId = {}) {
+  if (!Array.isArray(messages) || !byMessageId || typeof byMessageId !== "object") {
+    return Array.isArray(messages) ? messages : [];
+  }
+  return messages.map((message) => {
+    const id = normalizeText(message?.id);
+    const worklog = id ? byMessageId[id] : null;
+    return worklog ? { ...message, runtimeWorklog: worklog } : message;
+  });
+}
+
 function formatRuntimeTimeContext(now = new Date()) {
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "local";
   const localText = formatLocalRuntimeClock(now, timezone);
@@ -3313,6 +3462,161 @@ function interruptRuntimeRunsForSpeaker(runtimeRuns, speaker, detail = "") {
   ));
 }
 
+function runtimeEventNeedsStateSave(type) {
+  return [
+    "runtime.approval.requested",
+    "runtime.approval.responded",
+    "runtime.turn.completed",
+    "runtime.turn.failed",
+  ].includes(normalizeText(type));
+}
+
+function findRuntimeRunForEvent(runtimeRuns, event = {}) {
+  const payload = event.payload || {};
+  const speaker = normalizeSpeakerTarget(payload.speaker);
+  const threadId = normalizeText(payload.threadId);
+  const turnId = normalizeText(payload.turnId);
+  const runs = normalizeRuntimeRunList(runtimeRuns);
+  return [...runs].reverse().find((run) => (
+    (!speaker || run.speaker === speaker)
+    && (!threadId || !run.threadId || run.threadId === threadId)
+    && (!turnId || !run.turnId || run.turnId === turnId)
+  )) || null;
+}
+
+function runtimeWorklogEventForRuntimeEvent(run = {}, event = {}) {
+  const payload = event.payload || {};
+  const base = {
+    runId: run.id,
+    messageId: run.messageId,
+    detail: {},
+  };
+  if (event.type === "runtime.turn.started") {
+    return { ...base, type: "turn.started", title: "Turn started" };
+  }
+  if (event.type === "runtime.context.updated") {
+    return {
+      ...base,
+      type: "context.updated",
+      title: "Context ready",
+      detail: compactRecord({
+        inputTokens: Number(payload.inputTokens || 0) || undefined,
+        reusedTokens: (Number(payload.cacheReadInputTokens || 0)
+          || Number(payload.cachedInputTokens || 0))
+          || undefined,
+        currentTokens: Number(payload.currentTokens || 0) || undefined,
+      }),
+    };
+  }
+  if (event.type === "runtime.thinking.updated") {
+    return {
+      ...base,
+      type: "thinking.updated",
+      title: "Thinking captured",
+      detail: compactRecord({
+        text: truncateMonitoringText(payload.text, 12000),
+        chars: normalizeText(payload.text).length || undefined,
+      }),
+    };
+  }
+  if (event.type === "runtime.stderr") {
+    return {
+      ...base,
+      type: "terminal.stderr",
+      level: "warning",
+      title: "Terminal stderr",
+      detail: compactRecord({
+        text: truncateMonitoringText(payload.text, 12000),
+      }),
+    };
+  }
+  if (event.type === "runtime.approval.requested") {
+    return {
+      ...base,
+      type: "approval.requested",
+      level: "warning",
+      title: "Waiting for approval",
+      detail: compactRecord({
+        reason: normalizeText(payload.reason),
+        command: normalizeText(payload.command),
+        filePaths: Array.isArray(payload.filePaths) ? payload.filePaths.map(normalizeText).filter(Boolean) : [],
+      }),
+    };
+  }
+  if (event.type === "runtime.approval.responded") {
+    return {
+      ...base,
+      type: "approval.responded",
+      title: "Approval answered",
+      detail: compactRecord({
+        approved: typeof payload.approved === "boolean" ? payload.approved : undefined,
+        decision: normalizeText(payload.decision),
+      }),
+    };
+  }
+  if (event.type === "runtime.reply.completed") {
+    const text = normalizeText(payload.text);
+    return {
+      ...base,
+      type: "reply.completed",
+      title: "Reply text ready",
+      detail: compactRecord({ chars: text ? text.length : undefined }),
+    };
+  }
+  if (event.type === "runtime.tool.started") {
+    return {
+      ...base,
+      type: "tool.started",
+      title: normalizeText(payload.name) || "Tool started",
+      detail: compactRecord({
+        name: normalizeText(payload.name),
+        command: normalizeText(payload.command),
+        input: payload.input && typeof payload.input === "object" ? payload.input : undefined,
+        summary: normalizeText(payload.summary),
+      }),
+    };
+  }
+  if (event.type === "runtime.tool.finished") {
+    return {
+      ...base,
+      type: "tool.finished",
+      level: payload.isError || payload.status === "error" ? "error" : "info",
+      title: normalizeText(payload.name) || (payload.isError ? "Tool failed" : "Tool finished"),
+      detail: compactRecord({
+        name: normalizeText(payload.name),
+        status: normalizeText(payload.status),
+        output: truncateMonitoringText(payload.output, 20000),
+      }),
+    };
+  }
+  if (event.type === "runtime.turn.completed") {
+    return {
+      ...base,
+      type: "run.completed",
+      title: "Completed",
+      detail: compactRecord({ chars: normalizeText(payload.text).length || undefined }),
+    };
+  }
+  if (event.type === "runtime.turn.failed") {
+    return {
+      ...base,
+      type: "run.failed",
+      level: "error",
+      title: "Failed",
+      detail: compactRecord({ error: normalizeText(payload.error || payload.text) }),
+    };
+  }
+  return null;
+}
+
+function compactRecord(record = {}) {
+  return Object.fromEntries(
+    Object.entries(record).filter(([, value]) => (
+      Array.isArray(value) ? value.length : value !== undefined && value !== null && value !== ""
+    ))
+  );
+}
+
 function touchRuntimeRunsForEvent(runtimeRuns, event = {}) {
   const payload = event.payload || {};
   const speaker = normalizeSpeakerTarget(payload.speaker);
@@ -3334,6 +3638,10 @@ function touchRuntimeRunsForEvent(runtimeRuns, event = {}) {
     ...(threadId ? { threadId } : {}),
     ...(turnId ? { turnId } : {}),
   };
+  const timingDetail = runtimeTimingDetailForEvent(active, event);
+  if (timingDetail) {
+    patch.detail = timingDetail;
+  }
   if (event.type === "runtime.approval.requested") {
     patch.status = "waiting_approval";
     patch.detail = normalizeText(payload.reason) || normalizeText(payload.command) || active.detail;
@@ -3343,11 +3651,110 @@ function touchRuntimeRunsForEvent(runtimeRuns, event = {}) {
   return updateRuntimeRun(runs, active.id, patch);
 }
 
+function runtimeTimingDetailForEvent(run = {}, event = {}) {
+  const elapsed = formatElapsedSince(run.startedAt);
+  const payload = event.payload || {};
+  if (event.type === "runtime.turn.started") {
+    return elapsed ? `Turn started after ${elapsed}.` : "Turn started.";
+  }
+  if (event.type === "runtime.context.updated") {
+    const inputTokens = Number(payload.inputTokens || 0);
+    const cachedInputTokens = Number(payload.cachedInputTokens || 0);
+    const currentTokens = Number(payload.currentTokens || 0);
+    const pieces = [];
+    if (inputTokens) pieces.push(`${inputTokens} input`);
+    if (cachedInputTokens) pieces.push(`${cachedInputTokens} cached`);
+    if (currentTokens) pieces.push(`${currentTokens} total`);
+    const tokenText = pieces.length ? ` ${pieces.join(", ")} tokens.` : "";
+    return elapsed ? `Context ready at ${elapsed}.${tokenText}`.trim() : tokenText.trim();
+  }
+  if (event.type === "runtime.reply.delta") {
+    if (run.phase === "replying") {
+      return run.detail;
+    }
+    return elapsed ? `First text at ${elapsed}.` : "Replying.";
+  }
+  if (event.type === "runtime.reply.completed") {
+    return elapsed ? `Reply text ready at ${elapsed}; finalizing turn.` : "Reply text ready; finalizing turn.";
+  }
+  if (event.type === "runtime.turn.completed") {
+    return elapsed ? `Turn completed at ${elapsed}.` : "Turn completed.";
+  }
+  if (event.type === "runtime.turn.failed") {
+    return normalizeText(payload.error || payload.text) || (elapsed ? `Failed at ${elapsed}.` : "Failed.");
+  }
+  return "";
+}
+
+function buildRuntimeInputWorklogDetail({ speaker = "", state = {}, prompt = "", attachments = [] } = {}) {
+  const messages = Array.isArray(state.messages) ? state.messages : [];
+  const transcriptMessages = getReadableTranscriptMessages(messages);
+  const visibleMessages = transcriptMessages.map((message) => ({
+    id: normalizeText(message.id),
+    speaker: normalizeSpeakerTarget(message.speaker) || normalizeText(message.speaker),
+    at: normalizeIsoText(message.at),
+    chars: normalizeText(message.text).length,
+    pending: Boolean(message.pending),
+    attachments: Array.isArray(message.attachments) ? message.attachments.length : 0,
+  }));
+  return compactRecord({
+    speaker: normalizeSpeakerTarget(speaker),
+    topicId: normalizeText(state.id),
+    topic: normalizeText(state.topic),
+    promptChars: normalizeText(prompt).length,
+    prompt: truncateMonitoringText(prompt, 200000),
+    promptTruncated: normalizeText(prompt).length > 200000,
+    messageCount: visibleMessages.length,
+    messages: visibleMessages,
+    attachments: normalizeMonitoringAttachments(attachments),
+  });
+}
+
+function normalizeMonitoringAttachments(attachments = []) {
+  return (Array.isArray(attachments) ? attachments : []).map((attachment) => compactRecord({
+    name: normalizeText(attachment.name || attachment.filename || attachment.path),
+    mimeType: normalizeText(attachment.mimeType),
+    url: normalizeText(attachment.url),
+    localPath: normalizeText(attachment.localPath || attachment.path),
+    size: Number(attachment.size || 0) || undefined,
+  }));
+}
+
+function truncateMonitoringText(value, maxChars = 12000) {
+  const text = normalizeText(value);
+  if (!text || text.length <= maxChars) {
+    return text;
+  }
+  return `${text.slice(0, maxChars)}\n\n[truncated ${text.length - maxChars} chars]`;
+}
+
+function formatElapsedSince(isoText = "") {
+  const start = Date.parse(isoText);
+  if (!Number.isFinite(start)) {
+    return "";
+  }
+  const elapsedMs = Math.max(0, Date.now() - start);
+  if (elapsedMs < 1000) {
+    return `${elapsedMs}ms`;
+  }
+  const seconds = elapsedMs / 1000;
+  if (seconds < 60) {
+    return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const rest = Math.round(seconds % 60);
+  return `${minutes}m ${rest}s`;
+}
+
 function runtimePhaseForEvent(type) {
   if (type === "runtime.turn.started") return "started";
   if (type === "runtime.reply.delta") return "replying";
   if (type === "runtime.reply.completed") return "reply_ready";
   if (type === "runtime.context.updated") return "context_updated";
+  if (type === "runtime.tool.started") return "tool_running";
+  if (type === "runtime.tool.finished") return "tool_finished";
+  if (type === "runtime.thinking.updated") return "thinking";
+  if (type === "runtime.stderr") return "stderr";
   if (type === "runtime.approval.requested") return "waiting_approval";
   if (type === "runtime.approval.responded") return "resumed";
   if (type === "runtime.turn.completed") return "turn_completed";
@@ -4294,7 +4701,7 @@ function appendMessageText(draft, messageId, text) {
   message.pending = true;
 }
 
-function setMessageTextIfLonger(draft, messageId, text) {
+function setMessageTextIfLonger(draft, messageId, text, { pending = true, runtimeReplyReady = false } = {}) {
   const message = findMessage(draft, messageId);
   if (!message) {
     return;
@@ -4303,7 +4710,12 @@ function setMessageTextIfLonger(draft, messageId, text) {
   if (normalized.length >= normalizeText(message.text).length) {
     message.text = normalized;
   }
-  message.pending = true;
+  message.pending = Boolean(pending);
+  if (runtimeReplyReady) {
+    message.runtimeReplyReady = true;
+  } else {
+    delete message.runtimeReplyReady;
+  }
 }
 
 function finishPendingMessage(draft, messageId, fallbackText = "", { preferFallback = false } = {}) {
@@ -4316,6 +4728,7 @@ function finishPendingMessage(draft, messageId, fallbackText = "", { preferFallb
     message.text = normalizedFallback;
   }
   message.pending = false;
+  delete message.runtimeReplyReady;
 }
 
 function finishPendingMessages(draft, fallbackText = "") {

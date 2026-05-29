@@ -17,6 +17,8 @@ function readConfig() {
     codexEndpoint: readTextEnv("ROUNDTABLE_CODEX_ENDPOINT"),
     codexCommand: readTextEnv("ROUNDTABLE_CODEX_COMMAND"),
     codexAccessMode: readTextEnv("ROUNDTABLE_CODEX_ACCESS_MODE") || "default",
+    codexModel: readTextEnv("ROUNDTABLE_CODEX_MODEL"),
+    codexReasoningEffort: readTextEnv("ROUNDTABLE_CODEX_REASONING_EFFORT") || readTextEnv("ROUNDTABLE_CODEX_EFFORT"),
     turnTimeoutMs: readIntEnv("ROUNDTABLE_TURN_TIMEOUT_MS", 30 * 60 * 1000),
     turnStartTimeoutMs: readIntEnv("ROUNDTABLE_TURN_START_TIMEOUT_MS", 4 * 60 * 1000),
     claudeCommand: readTextEnv("ROUNDTABLE_CLAUDE_COMMAND") || resolveDefaultClaudeCommand(),

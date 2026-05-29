@@ -84,3 +84,41 @@ test("ClaudeCode runtime failure mapping uses payload.error", () => {
   assert.equal(mapped.type, "runtime.turn.failed");
   assert.equal(mapped.payload.error, "claudecode process closed with code 1");
 });
+
+test("ClaudeCode monitor events map thinking tools and stderr", () => {
+  const thinking = mapClaudeCodeMessageToRuntimeEvent({
+    type: "thinking",
+    sessionId: "session-1",
+    turnId: "turn-1",
+    text: "check the failing request",
+  });
+  const tool = mapClaudeCodeMessageToRuntimeEvent({
+    type: "tool.use",
+    sessionId: "session-1",
+    turnId: "turn-1",
+    toolName: "Bash",
+    input: { command: "npm test" },
+  });
+  const result = mapClaudeCodeMessageToRuntimeEvent({
+    type: "tool.result",
+    sessionId: "session-1",
+    turnId: "turn-1",
+    toolResult: "401 unauthorized",
+    isError: true,
+  });
+  const stderr = mapClaudeCodeMessageToRuntimeEvent({
+    type: "stderr",
+    sessionId: "session-1",
+    turnId: "turn-1",
+    text: "HTTP 400 bad request",
+  });
+
+  assert.equal(thinking.type, "runtime.thinking.updated");
+  assert.equal(thinking.payload.text, "check the failing request");
+  assert.equal(tool.type, "runtime.tool.started");
+  assert.equal(tool.payload.input.command, "npm test");
+  assert.equal(result.type, "runtime.tool.finished");
+  assert.equal(result.payload.isError, true);
+  assert.equal(stderr.type, "runtime.stderr");
+  assert.equal(stderr.payload.text, "HTTP 400 bad request");
+});

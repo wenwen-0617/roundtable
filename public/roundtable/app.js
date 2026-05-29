@@ -14,6 +14,8 @@ const state = {
   hiddenTopicIds: [],
   summaryPending: false,
   runtimeStatus: null,
+  serverMessages: [],
+  optimisticMessages: [],
   summarySelectedIds: new Set(),
   notebook: null,
   notebookProjectId: "",
@@ -506,17 +508,36 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(() => {});
 }
 
-async function refreshState() {
+let refreshStateInFlight = null;
+
+async function refreshState({ silentTimeout = false } = {}) {
+  if (refreshStateInFlight) {
+    return refreshStateInFlight;
+  }
+  refreshStateInFlight = refreshStateNow({ silentTimeout });
+  try {
+    return await refreshStateInFlight;
+  } finally {
+    refreshStateInFlight = null;
+  }
+}
+
+async function refreshStateNow({ silentTimeout = false } = {}) {
   try {
     const data = await fetchJson("/api/state");
     render(data);
   } catch (error) {
+    if (silentTimeout && isRequestTimeoutError(error)) {
+      console.warn(error.message);
+      return;
+    }
     showError(error.message);
   }
 }
 
 async function postJson(url, body, options = {}) {
   state.busy = true;
+  state.lastPostError = null;
   try {
     const data = await fetchJson(url, {
       method: "POST",
@@ -528,6 +549,7 @@ async function postJson(url, body, options = {}) {
     }
     return data;
   } catch (error) {
+    state.lastPostError = error;
     showError(error.message);
     return null;
   } finally {
@@ -555,17 +577,32 @@ async function submitUserMessage({ interrupt = false } = {}) {
   }
   const attachments = pendingAttachments.map(({ attachment }) => attachment).filter(Boolean);
   const baseBody = { text, attachments, target: state.target };
+  const sentDraft = els.interjectInput.value;
+  const optimisticId = addOptimisticUserMessage({ text, attachments });
+  els.interjectInput.value = "";
+  resizeInterjectInput();
   let result = null;
   if (state.target === "none") {
     result = await postJson("/api/user-only", { ...baseBody, noReply: true, interrupt });
   } else {
     result = await postJson("/api/user", { ...baseBody, interrupt });
   }
-  if (result) {
-    els.interjectInput.value = "";
-    resizeInterjectInput();
+  if (result || isSubmitLikelyAlreadyAccepted(state.lastPostError)) {
     clearPendingAttachments();
+    void refreshState();
+  } else {
+    removeOptimisticMessage(optimisticId);
+    els.interjectInput.value = sentDraft;
+    resizeInterjectInput();
   }
+}
+
+function isSubmitLikelyAlreadyAccepted(error) {
+  return isRequestTimeoutError(error);
+}
+
+function isRequestTimeoutError(error) {
+  return /request took too long/i.test(String(error?.message || ""));
 }
 
 async function fetchJson(url, options = {}, { timeoutMs = 8000 } = {}) {
@@ -621,9 +658,15 @@ function render(data) {
   if (els.topicRenameInput && (topicChanged || !els.topicRenameInput.value.trim())) {
     els.topicRenameInput.value = data.topic ? topicDisplayName(data.topic) : "";
   }
-  renderMessages(data.messages || []);
+  if (topicChanged) resetRenderedMessages();
+  state.serverMessages = data.messages || [];
+  reconcileOptimisticMessages(state.serverMessages);
+  renderMessages(messagesWithOptimisticState(state.serverMessages));
   renderRuntimeStatus(data.runtimeStatus || null);
   renderApprovals(data.pendingApprovals || []);
+  if (data.runtimeStatus?.busy && isWorklogActive()) {
+    refreshWorklog();
+  }
   renderTopics(data.topics || []);
   renderSideTopics(data);
   syncLocalHiddenTopicsToServer();
@@ -726,15 +769,8 @@ function renderRuntimeStatus(runtimeStatus) {
   }
   updateComposerForRuntime(runtimeStatus);
   const activeRuns = Array.isArray(runtimeStatus?.activeRuns) ? runtimeStatus.activeRuns : [];
-  const recentRuns = Array.isArray(runtimeStatus?.recentRuns) ? runtimeStatus.recentRuns : [];
 
-  const lingerMs = 90 * 1000;
-  const recentVisible = recentRuns.filter((run) => {
-    if (!run.endedAt) return false;
-    return Date.now() - new Date(run.endedAt).getTime() < lingerMs;
-  });
-
-  if (!runtimeStatus?.busy && !activeRuns.length && !recentVisible.length) {
+  if (!runtimeStatus?.busy && !activeRuns.length) {
     els.runtimeStatusPanel.hidden = true;
     els.runtimeStatusPanel.replaceChildren();
     return;
@@ -743,49 +779,19 @@ function renderRuntimeStatus(runtimeStatus) {
   els.runtimeStatusPanel.hidden = false;
 
   if (activeRuns.length) {
-    const head = document.createElement("div");
-    head.className = "runtime-status-head";
-    const title = document.createElement("span");
-    title.textContent = activeRuns.some((run) => run.status === "waiting_approval")
-      ? "等待处理"
-      : "正在干活";
-    const round = runtimeStatus.round || {};
-    const meta = document.createElement("small");
-    meta.textContent = `Round ${round.current || 0}`;
-    head.append(title, meta);
-
     const runs = document.createElement("div");
     runs.className = "runtime-runs";
     for (const run of activeRuns) {
       runs.append(renderRuntimeChip(run));
     }
-
-    const note = document.createElement("div");
-    note.className = "runtime-status-note";
-    note.textContent = runtimeStatus.notice || "发送的消息不会中断正在进行的工作。";
-
-    els.runtimeStatusPanel.replaceChildren(head, runs, note);
+    els.runtimeStatusPanel.replaceChildren(runs);
   } else if (runtimeStatus?.busy) {
     const head = document.createElement("div");
     head.className = "runtime-status-head";
     const title = document.createElement("span");
-    title.textContent = "状态确认中";
+    title.textContent = "准备中…";
     head.append(title);
     els.runtimeStatusPanel.replaceChildren(head);
-  } else {
-    const head = document.createElement("div");
-    head.className = "runtime-status-head";
-    const title = document.createElement("span");
-    title.textContent = "最近完成";
-    head.append(title);
-
-    const runs = document.createElement("div");
-    runs.className = "runtime-runs";
-    for (const run of recentVisible.slice(0, 3)) {
-      runs.append(renderRuntimeChip({ ...run, since: run.endedAt }));
-    }
-
-    els.runtimeStatusPanel.replaceChildren(head, runs);
   }
 }
 
@@ -1230,9 +1236,63 @@ function renderTopicsDrawer() {
 // Keyed cache so existing messages are updated in-place, never re-animated
 const renderedMsgMap = new Map(); // key → { element }
 
+// Clear all rendered messages/day-dividers (e.g. on topic switch) so the
+// append-only renderer rebuilds from a clean slate instead of reusing stale
+// elements that would otherwise keep their old DOM position.
+function resetRenderedMessages() {
+  for (const { element } of renderedMsgMap.values()) {
+    element.remove();
+  }
+  renderedMsgMap.clear();
+  state.lastMessageSig = "";
+  state.lastMessageCount = 0;
+}
+
+function addOptimisticUserMessage({ text = "", attachments = [] } = {}) {
+  const message = {
+    id: `optimistic-user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    speaker: "user",
+    text,
+    attachments,
+    at: new Date().toISOString(),
+    optimistic: true,
+  };
+  state.optimisticMessages.push(message);
+  renderMessages(messagesWithOptimisticState(state.serverMessages || []));
+  return message.id;
+}
+
+function removeOptimisticMessage(id) {
+  if (!id) return;
+  state.optimisticMessages = state.optimisticMessages.filter((message) => message.id !== id);
+  renderMessages(messagesWithOptimisticState(state.serverMessages || []));
+}
+
+function reconcileOptimisticMessages(serverMessages = []) {
+  if (!state.optimisticMessages.length) return;
+  state.optimisticMessages = state.optimisticMessages.filter((optimistic) =>
+    !serverMessages.some((message) => isServerMatchForOptimistic(message, optimistic))
+  );
+}
+
+function messagesWithOptimisticState(serverMessages = []) {
+  if (!state.optimisticMessages.length) return serverMessages;
+  return [...serverMessages, ...state.optimisticMessages];
+}
+
+function isServerMatchForOptimistic(message, optimistic) {
+  if (!message || !optimistic || message.speaker !== "user") return false;
+  if ((message.text || "") !== (optimistic.text || "")) return false;
+  if (attachmentSig(message.attachments) !== attachmentSig(optimistic.attachments)) return false;
+  const serverTime = Date.parse(message.at || "");
+  const optimisticTime = Date.parse(optimistic.at || "");
+  if (!Number.isFinite(serverTime) || !Number.isFinite(optimisticTime)) return true;
+  return serverTime >= optimisticTime - 5000 && serverTime <= optimisticTime + 60000;
+}
+
 function messagesSig(messages) {
   return messages.map((m, index) =>
-    `${msgKey(m, index)}|${m.speaker || ""}|${m.pending ? "1" : "0"}|${m.voiceOnly ? "1" : "0"}|${m.audioUrl || ""}|${(m.text || "").slice(-40)}|${attachmentSig(m.attachments)}`
+    `${msgKey(m, index)}|${m.speaker || ""}|${m.pending ? "1" : "0"}|${m.runtimeReplyReady ? "1" : "0"}|${m.optimistic ? "1" : "0"}|${m.voiceOnly ? "1" : "0"}|${m.audioUrl || ""}|${m.at || ""}|${(m.text || "").slice(-40)}|${attachmentSig(m.attachments)}|${worklogSig(m.runtimeWorklog)}`
   ).join("~");
 }
 
@@ -1248,8 +1308,21 @@ function renderMessages(messages) {
   state.lastMessageSig = sig;
 
   const activeKeys = new Set();
+  let prevDayKey = null;
 
   messages.filter(shouldRenderMessage).forEach((message, index) => {
+    const dayKey = messageDayKey(message);
+    if (dayKey && dayKey !== prevDayKey) {
+      prevDayKey = dayKey;
+      const dividerKey = `daydivider:${dayKey}`;
+      activeKeys.add(dividerKey);
+      if (!renderedMsgMap.has(dividerKey)) {
+        const dividerEl = renderDayDivider(message);
+        els.messages.appendChild(dividerEl);
+        renderedMsgMap.set(dividerKey, { element: dividerEl, divider: true });
+      }
+    }
+
     const key = msgKey(message, index);
     activeKeys.add(key);
 
@@ -1260,8 +1333,9 @@ function renderMessages(messages) {
       const textEl = element.querySelector(".text");
       const timeEl = element.querySelector("time");
       updateMessageContent(textEl, message, entry);
+      updateMessageWorklog(element, message, entry);
       if (timeEl) {
-        timeEl.textContent = message.pending ? "generating" : formatTime(message.at);
+        timeEl.textContent = formatMessageTimeLabel(message);
       }
     } else {
       // Brand-new message — create and append (animation fires once)
@@ -1274,6 +1348,7 @@ function renderMessages(messages) {
         audioUrl: message.audioUrl || "",
         voiceOnly: Boolean(message.voiceOnly),
         pending: Boolean(message.pending),
+        worklog: worklogSig(message.runtimeWorklog),
       });
     }
   });
@@ -1331,7 +1406,7 @@ function renderMessage(message) {
   name.textContent = speakerName(message);
 
   const time = document.createElement("time");
-  time.textContent = message.pending ? "generating" : formatTime(message.at);
+  time.textContent = formatMessageTimeLabel(message);
 
   const actions = renderMessageActions(message);
 
@@ -1339,7 +1414,10 @@ function renderMessage(message) {
   text.className = "text";
   renderMessageContent(text, message);
 
-  meta.append(name, time, actions);
+  const worklog = renderMessageWorklog(message.runtimeWorklog);
+  meta.append(name);
+  if (worklog) meta.append(worklog);
+  meta.append(time, actions);
   bubble.append(meta, text);
   article.append(avatar, bubble);
   return article;
@@ -1383,6 +1461,152 @@ function renderMessageActions(message) {
   menu.append(deleteButton);
   wrap.append(menuButton, menu);
   return wrap;
+}
+
+function formatMessageTimeLabel(message = {}) {
+  if (message.optimistic) return "sending";
+  if (message.runtimeReplyReady) return "finalizing";
+  if (message.pending) return "generating";
+  return formatTime(message.at);
+}
+
+function worklogSig(worklog = null) {
+  if (!worklog) return "";
+  const run = worklog.run || {};
+  const events = Array.isArray(worklog.events) ? worklog.events : [];
+  return [
+    run.id || "",
+    run.status || "",
+    run.phase || "",
+    run.detail || "",
+    worklog.summary || "",
+    events.map((event) => `${event.id || ""}:${event.type || ""}:${event.title || ""}`).join(","),
+  ].join("|");
+}
+
+function updateMessageWorklog(element, message, entry) {
+  const nextSig = worklogSig(message.runtimeWorklog);
+  if (nextSig === entry.worklog) return;
+  const existing = element.querySelector(".message-worklog");
+  const next = renderMessageWorklog(message.runtimeWorklog);
+  if (existing && next) {
+    existing.replaceWith(next);
+  } else if (existing) {
+    existing.remove();
+  } else if (next) {
+    const meta = element.querySelector(".meta");
+    const timeEl = meta?.querySelector("time");
+    if (meta && timeEl) {
+      meta.insertBefore(next, timeEl);
+    } else if (meta) {
+      meta.append(next);
+    }
+  }
+  entry.worklog = nextSig;
+}
+
+function isActiveRunStatus(status) {
+  return ["running", "waiting_approval", "checking_in", "queued"].includes(status);
+}
+
+function renderMessageWorklog(worklog = null) {
+  if (!worklog?.run) return null;
+  const events = Array.isArray(worklog.events) ? worklog.events : [];
+  if (!events.length && !worklog.summary) return null;
+  const active = isActiveRunStatus(worklog.run.status);
+  const wrap = document.createElement("details");
+  wrap.className = `message-worklog ${active ? "active" : "done"}`;
+
+  const summary = document.createElement("summary");
+  summary.className = "message-worklog-summary";
+
+  const status = document.createElement("span");
+  status.className = "message-worklog-status";
+  status.textContent = active ? formatWorklogStatusHuman(worklog) : `${events.length}步`;
+
+  summary.append(status);
+  wrap.append(summary);
+
+  if (events.length) {
+    const list = document.createElement("ol");
+    list.className = "message-worklog-events";
+    for (const event of events.slice(-6)) {
+      list.append(renderWorklogEventHuman(event));
+    }
+    wrap.append(list);
+  }
+  return wrap;
+}
+
+function renderWorklogEventHuman(event = {}) {
+  const item = document.createElement("li");
+  const isThinking = event.type === "thinking.updated" && Boolean((event.detail?.text || "").trim());
+  item.className = `message-worklog-event ${event.level || "info"}${isThinking ? " thinking" : ""}`;
+  item.textContent = humanizeWorklogEvent(event);
+  return item;
+}
+
+function formatWorklogStatusHuman(worklog = {}) {
+  const run = worklog.run || {};
+  const status = run.status || "";
+  if (status === "waiting_approval") return "等待授权…";
+  if (status === "checking_in") return "巡房中…";
+  const phase = run.phase || "";
+  if (phase === "queued") return "排队中…";
+  if (phase === "started") return "启动中…";
+  if (phase === "replying") return "正在回复…";
+  if (phase === "context_updated") return "读取上下文…";
+  if (phase === "waiting_approval") return "等待授权…";
+  return run.detail || "处理中…";
+}
+
+function humanizeWorklogEvent(event = {}) {
+  const type = event.type || "";
+  const title = event.title || "";
+  const time = event.createdAt ? new Date(event.createdAt).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
+  const prefix = time ? `${time} ` : "";
+  const detail = event.detail || {};
+  if (type === "input.captured") return `${prefix}记录本轮发给 AI 的完整上下文`;
+  if (type === "thinking.updated") {
+    const thought = (detail.text || "").trim();
+    return thought ? `${prefix}💭 ${thought}` : `${prefix}记录 Claude 思路`;
+  }
+  if (type === "terminal.stderr") return `${prefix}终端 stderr：${firstLine(detail.text) || "有输出"}`;
+  if (type === "tool.started") return `${prefix}调用工具：${detail.name || title || "tool"}`;
+  if (type === "tool.finished") return `${prefix}${detail.status === "error" ? "工具报错" : "工具返回"}${detail.name ? `：${detail.name}` : ""}`;
+  if (type.includes("queued") || title.includes("Queued")) return `${prefix}已排队`;
+  if (type.includes("started") || title.includes("started")) return `${prefix}开始处理`;
+  if (type.includes("context") || title.includes("Context")) return `${prefix}上下文当前占用${formatContextTokens(detail)}`;
+  if (type.includes("approval.requested") || title.includes("approval")) return `${prefix}请求授权${detail.command ? `：${firstLine(detail.command)}` : ""}`;
+  if (type.includes("approval.responded") || type.includes("approval.resolved")) return `${prefix}授权已回应`;
+  if (type.includes("replying") || title.includes("Replying")) return `${prefix}正在生成回复`;
+  if (type.includes("reply_ready") || title.includes("Reply")) return `${prefix}回复就绪`;
+  if (type.includes("completed") || title.includes("Completed")) return `${prefix}完成`;
+  if (type.includes("failed") || title.includes("Failed")) return `${prefix}运行失败${detail.error ? `：${firstLine(detail.error)}` : ""}`;
+  if (type.includes("interrupted")) return `${prefix}已中断`;
+  if (type.includes("resumed")) return `${prefix}继续运行`;
+  return `${prefix}${title || type || "运行中"}`;
+}
+
+function firstLine(value = "") {
+  return String(value || "").split(/\r?\n/u).map((line) => line.trim()).find(Boolean) || "";
+}
+
+function formatTokenCount(value) {
+  const n = Number(value) || 0;
+  if (n >= 10000) return `${(n / 10000).toFixed(n >= 100000 ? 0 : 1)}万`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(n);
+}
+
+function formatContextTokens(detail = {}) {
+  const current = Number(detail.currentTokens) || 0;
+  if (!current) return "";
+  const reused = Number(detail.reusedTokens) || 0;
+  // Only surface cache reuse when it is a meaningful share of the window;
+  // the first step writes the cache (reused≈0) and would otherwise look identical.
+  const reusedNote = reused >= current * 0.2 ? `，复用缓存 ${formatTokenCount(reused)}` : "";
+  return `（${formatTokenCount(current)} tokens${reusedNote}）`;
 }
 
 function closeAllMessageMenus() {
@@ -1677,6 +1901,10 @@ function showError(message) {
   els.errorBox.textContent = message;
 }
 
+function isWorklogActive() {
+  return document.querySelector('.view-panel[data-panel="worklog"]')?.classList.contains("active") || false;
+}
+
 function setActiveView(view) {
   const target = view || "chat";
   for (const button of document.querySelectorAll("[data-view]")) {
@@ -1765,6 +1993,37 @@ function initials(speaker) {
     default:
       return "Y";
   }
+}
+
+function messageDayKey(message) {
+  const date = new Date(message?.at || "");
+  if (Number.isNaN(date.getTime())) return null;
+  return `${date.getFullYear()}-${date.getMonth() + 1}-${date.getDate()}`;
+}
+
+function formatDayLabel(message) {
+  const date = new Date(message?.at || "");
+  if (Number.isNaN(date.getTime())) return "";
+  const now = new Date();
+  const startOfDay = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const diffDays = Math.round((startOfDay(now) - startOfDay(date)) / 86400000);
+  if (diffDays === 0) return "今天";
+  if (diffDays === 1) return "昨天";
+  if (diffDays === 2) return "前天";
+  const weekday = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"][date.getDay()];
+  if (date.getFullYear() === now.getFullYear()) {
+    return `${date.getMonth() + 1}月${date.getDate()}日 ${weekday}`;
+  }
+  return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日`;
+}
+
+function renderDayDivider(message) {
+  const wrap = document.createElement("div");
+  wrap.className = "day-divider";
+  const label = document.createElement("span");
+  label.textContent = formatDayLabel(message);
+  wrap.append(label);
+  return wrap;
 }
 
 function formatTime(value) {
@@ -2214,20 +2473,24 @@ async function refreshStorage() {
 async function refreshWorklog() {
   if (!els.worklogContent) return;
   try {
-    const status = await fetchJson("/api/runtime/status");
-    renderWorklog(status);
+    const [status, worklog] = await Promise.all([
+      fetchJson("/api/runtime/status"),
+      fetchJson("/api/runtime/worklog?scope=all&days=7&limit=1000").catch(() => ({ runs: [], events: [] })),
+    ]);
+    renderWorklog(status, worklog);
   } catch (error) {
     els.worklogContent.innerHTML = `<p class="worklog-empty">${escapeHtml(error.message || "日志读取失败。")}</p>`;
   }
 }
 
-function renderWorklog(status) {
+function renderWorklog(status, worklog = {}) {
   if (!els.worklogContent) return;
   const activeRuns = Array.isArray(status?.activeRuns) ? status.activeRuns : [];
-  const recentRuns = Array.isArray(status?.recentRuns) ? status.recentRuns : [];
+  const allEvents = Array.isArray(worklog?.events) ? worklog.events : [];
   const recentEvents = Array.isArray(status?.recentEvents) ? status.recentEvents : [];
+  const events = allEvents.length ? allEvents : recentEvents;
 
-  if (!activeRuns.length && !recentRuns.length && !recentEvents.length) {
+  if (!activeRuns.length && !events.length) {
     els.worklogContent.innerHTML = '<p class="worklog-empty">暂无运行记录。</p>';
     return;
   }
@@ -2235,62 +2498,302 @@ function renderWorklog(status) {
   const sections = [];
 
   if (activeRuns.length) {
-    const activeSection = document.createElement("section");
-    activeSection.className = "worklog-section";
+    const sec = document.createElement("section");
+    sec.className = "worklog-section";
     const h = document.createElement("h3");
-    h.textContent = "正在运行";
-    activeSection.append(h, renderWorklogRunList(activeRuns));
-    sections.push(activeSection);
-  }
-
-  if (recentRuns.length) {
-    const recentSection = document.createElement("section");
-    recentSection.className = "worklog-section";
-    const h = document.createElement("h3");
-    h.textContent = "最近完成";
-    recentSection.append(h, renderWorklogRunList(recentRuns));
-    sections.push(recentSection);
-  }
-
-  if (recentEvents.length) {
-    const eventsSection = document.createElement("section");
-    eventsSection.className = "worklog-section";
-    const h = document.createElement("h3");
-    h.textContent = "事件流";
+    h.textContent = "当前活跃";
     const list = document.createElement("ul");
-    list.className = "worklog-events";
-    for (const event of recentEvents) {
+    list.className = "worklog-runs";
+    for (const run of activeRuns) {
       const li = document.createElement("li");
-      const timeStr = event.at ? new Date(event.at).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "";
-      li.textContent = [timeStr, event.speaker || "system", event.type].filter(Boolean).join(" · ");
+      li.className = `worklog-run active`;
+      const speaker = run.label || run.speaker || "System";
+      const statusText = formatWorklogStatusHuman({ run });
+      const elapsed = formatElapsed(run.since);
+      li.innerHTML = `<strong>${escapeHtml(speaker)}</strong> <span class="worklog-run-status">${escapeHtml(statusText)}</span>${elapsed ? ` <time>${escapeHtml(elapsed)}</time>` : ""}`;
       list.append(li);
     }
-    eventsSection.append(h, list);
-    sections.push(eventsSection);
+    sec.append(h, list);
+    sections.push(sec);
+  }
+
+  const diagnostics = renderWorklogDiagnostics(activeRuns, events);
+  if (diagnostics) {
+    sections.push(diagnostics);
+  }
+
+  if (events.length) {
+    const runs = Array.isArray(worklog?.runs) ? worklog.runs : [];
+    const sec = document.createElement("section");
+    sec.className = "worklog-section";
+    const h = document.createElement("h3");
+    h.textContent = "运行记录";
+    sec.append(h, renderGroupedWorklogTimeline(events, runs));
+    sections.push(sec);
   }
 
   els.worklogContent.replaceChildren(...sections);
 }
 
-function renderWorklogRunList(runs) {
+const WORKLOG_TOPIC_INITIAL_EVENTS = 18;
+
+function renderGroupedWorklogTimeline(events = [], runs = []) {
+  const runById = new Map((Array.isArray(runs) ? runs : [])
+    .filter((run) => run?.id)
+    .map((run) => [run.id, run]));
+  const dayGroups = groupWorklogEvents(events, runById);
+  const wrap = document.createElement("div");
+  wrap.className = "worklog-days";
+  if (!dayGroups.length) {
+    const empty = document.createElement("p");
+    empty.className = "worklog-empty";
+    empty.textContent = "暂无运行记录。";
+    wrap.append(empty);
+    return wrap;
+  }
+  const todayKey = worklogDateKey(new Date());
+  for (const day of dayGroups) {
+    const details = document.createElement("details");
+    details.className = "worklog-day";
+    details.open = day.key === todayKey;
+
+    const summary = document.createElement("summary");
+    summary.className = "worklog-day-summary";
+    const date = document.createElement("span");
+    date.textContent = day.label;
+    const count = document.createElement("small");
+    count.textContent = `${day.eventCount} 条`;
+    summary.append(date, count);
+    details.append(summary);
+
+    for (const topic of day.topics) {
+      details.append(renderWorklogTopicGroup(topic, runById));
+    }
+    wrap.append(details);
+  }
+  return wrap;
+}
+
+function groupWorklogEvents(events = [], runById = new Map()) {
+  const sortedEvents = [...events].sort((a, b) => (
+    Date.parse(worklogEventTimestamp(a)) - Date.parse(worklogEventTimestamp(b))
+    || Number(a.id || 0) - Number(b.id || 0)
+  ));
+  const dayByKey = new Map();
+  for (const event of sortedEvents) {
+    const date = worklogEventDate(event);
+    const dayKey = worklogDateKey(date);
+    if (!dayByKey.has(dayKey)) {
+      dayByKey.set(dayKey, {
+        key: dayKey,
+        label: formatWorklogDateLabel(date),
+        topics: new Map(),
+        eventCount: 0,
+      });
+    }
+    const day = dayByKey.get(dayKey);
+    const topicKey = worklogTopicKey(event, runById);
+    if (!day.topics.has(topicKey)) {
+      day.topics.set(topicKey, {
+        key: topicKey,
+        title: worklogTopicLabel(event, runById),
+        events: [],
+      });
+    }
+    day.topics.get(topicKey).events.push(event);
+    day.eventCount += 1;
+  }
+  return [...dayByKey.values()]
+    .sort((a, b) => b.key.localeCompare(a.key))
+    .map((day) => ({
+      ...day,
+      topics: [...day.topics.values()],
+    }));
+}
+
+function renderWorklogTopicGroup(topic, runById) {
+  const section = document.createElement("section");
+  section.className = "worklog-topic";
+  const title = document.createElement("h4");
+  title.textContent = topic.title || "未命名话题";
+  const list = document.createElement("ul");
+  list.className = "worklog-timeline";
+  const visibleEvents = topic.events.slice(0, WORKLOG_TOPIC_INITIAL_EVENTS);
+  for (const event of visibleEvents) {
+    list.append(renderWorklogTimelineItem(event, runById));
+  }
+  section.append(title, list);
+  if (topic.events.length > visibleEvents.length) {
+    const more = document.createElement("button");
+    more.type = "button";
+    more.className = "worklog-more";
+    more.textContent = `显示更多 ${topic.events.length - visibleEvents.length}`;
+    more.addEventListener("click", () => {
+      for (const event of topic.events.slice(visibleEvents.length)) {
+        list.append(renderWorklogTimelineItem(event, runById));
+      }
+      more.remove();
+    });
+    section.append(more);
+  }
+  return section;
+}
+
+function renderWorklogTimelineItem(event = {}, runById = new Map()) {
+  const li = document.createElement("li");
+  li.className = `worklog-timeline-item ${event.level || "info"}`;
+  const timeStr = formatWorklogTimeLabel(worklogEventDate(event));
+  const speakerLabel = worklogSpeakerLabel(event, runById);
+  const humanText = humanizeWorklogEvent(event).replace(/^\d{2}:\d{2}:\d{2}\s*/, "");
+  const row = document.createElement("div");
+  row.className = "worklog-timeline-row";
+  row.innerHTML = `<time>${escapeHtml(timeStr)}</time>${speakerLabel ? ` <strong>${escapeHtml(speakerLabel)}</strong>` : ""} <span>${escapeHtml(humanText)}</span>`;
+  li.append(row);
+  const detail = renderWorklogEventDetail(event);
+  if (detail) {
+    li.append(detail);
+  }
+  return li;
+}
+
+function worklogEventTimestamp(event = {}) {
+  return event.createdAt || event.at || "";
+}
+
+function worklogEventDate(event = {}) {
+  const date = new Date(worklogEventTimestamp(event));
+  return Number.isNaN(date.getTime()) ? new Date(0) : date;
+}
+
+function worklogDateKey(date) {
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("-");
+}
+
+function formatWorklogDateLabel(date) {
+  return `${date.getFullYear()}.${date.getMonth() + 1}.${date.getDate()}`;
+}
+
+function formatWorklogTimeLabel(date) {
+  return date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function worklogTopicKey(event = {}, runById = new Map()) {
+  const run = runById.get(event.runId) || {};
+  return event.topicId || run.topicId || event.topicTitle || run.topicTitle || "unknown";
+}
+
+function worklogTopicLabel(event = {}, runById = new Map()) {
+  const run = runById.get(event.runId) || {};
+  return topicDisplayName(event.topicTitle || run.topicTitle || event.topicId || run.topicId || "未命名话题");
+}
+
+function worklogSpeakerLabel(event = {}, runById = new Map()) {
+  if (event.type === "input.captured") return "圆桌";
+  const run = runById.get(event.runId) || {};
+  const speaker = event.speaker || run.speaker || "";
+  if (speaker === "codex") return "Codex";
+  if (speaker === "claude") return "Claude Code";
+  return speaker || "系统";
+}
+
+function renderWorklogDiagnostics(activeRuns = [], events = []) {
+  if (!activeRuns.length || !events.length) return null;
+  const hints = [];
+  const eventsByRun = new Map();
+  for (const event of events) {
+    if (!event.runId) continue;
+    const list = eventsByRun.get(event.runId) || [];
+    list.push(event);
+    eventsByRun.set(event.runId, list);
+  }
+  for (const run of activeRuns) {
+    const runEvents = eventsByRun.get(run.id) || [];
+    const latest = runEvents.at(-1);
+    const contextCount = runEvents.filter((event) => event.type === "context.updated").length;
+    const toolStart = [...runEvents].reverse().find((event) => event.type === "tool.started");
+    const toolFinishedAfterStart = toolStart
+      ? runEvents.some((event) => event.type === "tool.finished" && event.id > toolStart.id)
+      : false;
+    const waitSeconds = latest?.createdAt ? Math.floor((Date.now() - Date.parse(latest.createdAt)) / 1000) : 0;
+    if (run.status === "waiting_approval") {
+      hints.push(`${speakerName({ speaker: run.speaker })} 正在等你授权，已经 ${formatElapsed(run.since) || "一会儿"}。`);
+    } else if (toolStart && !toolFinishedAfterStart && waitSeconds > 20) {
+      hints.push(`${speakerName({ speaker: run.speaker })} 可能卡在工具调用：${toolStart.detail?.name || toolStart.title || "tool"}，${waitSeconds}s 没有返回。`);
+    } else if (contextCount >= 6 && latest?.type === "context.updated") {
+      hints.push(`${speakerName({ speaker: run.speaker })} 一直在刷新上下文，已记录 ${contextCount} 次，暂时还没稳定产出。`);
+    }
+  }
+  if (!hints.length) return null;
+  const sec = document.createElement("section");
+  sec.className = "worklog-section worklog-diagnostics";
+  const h = document.createElement("h3");
+  h.textContent = "监控提示";
   const list = document.createElement("ul");
   list.className = "worklog-runs";
-  for (const run of runs) {
+  for (const hint of hints) {
     const li = document.createElement("li");
-    li.className = `worklog-run ${run.status || ""}`;
-    const timeStr = (run.endedAt || run.since)
-      ? new Date(run.endedAt || run.since).toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" })
-      : "";
-    const parts = [
-      run.label || run.title || "System",
-      runtimeStatusLabel(run.status),
-      run.detail || "",
-      timeStr,
-    ].filter(Boolean);
-    li.textContent = parts.join(" · ");
+    li.className = "worklog-run warning";
+    li.textContent = hint;
     list.append(li);
   }
-  return list;
+  sec.append(h, list);
+  return sec;
+}
+
+function renderWorklogEventDetail(event = {}) {
+  const detail = event.detail && typeof event.detail === "object" ? event.detail : {};
+  const blocks = [];
+  if (detail.prompt) {
+    blocks.push({
+      title: `AI 实际上下文 (${detail.promptChars || detail.prompt.length} chars${detail.promptTruncated ? ", truncated" : ""})`,
+      text: detail.prompt,
+    });
+  }
+  if (Array.isArray(detail.messages) && detail.messages.length) {
+    blocks.push({
+      title: `消息范围 (${detail.messageCount || detail.messages.length})`,
+      text: JSON.stringify(detail.messages, null, 2),
+    });
+  }
+  if (Array.isArray(detail.attachments) && detail.attachments.length) {
+    blocks.push({
+      title: `附件 (${detail.attachments.length})`,
+      text: JSON.stringify(detail.attachments, null, 2),
+    });
+  }
+  if (detail.command) {
+    blocks.push({ title: "命令 / 工具请求", text: detail.command });
+  }
+  if (detail.input) {
+    blocks.push({ title: "工具输入", text: JSON.stringify(detail.input, null, 2) });
+  }
+  if (detail.output) {
+    blocks.push({ title: detail.status === "error" ? "工具错误输出" : "工具输出", text: detail.output });
+  }
+  if (detail.text) {
+    blocks.push({ title: event.type === "terminal.stderr" ? "stderr" : "思路 / 终端文本", text: detail.text });
+  }
+  if (detail.error) {
+    blocks.push({ title: "错误", text: detail.error });
+  }
+  if (!blocks.length) return null;
+  const wrap = document.createElement("div");
+  wrap.className = "worklog-detail-blocks";
+  for (const block of blocks) {
+    const details = document.createElement("details");
+    details.className = "worklog-detail";
+    const summary = document.createElement("summary");
+    summary.textContent = block.title;
+    const pre = document.createElement("pre");
+    pre.textContent = block.text || "";
+    details.append(summary, pre);
+    wrap.append(details);
+  }
+  return wrap;
 }
 
 async function refreshNotebook() {
@@ -3600,9 +4103,8 @@ refreshMemoryProjectInput();
 refreshState();
 setInterval(() => {
   if (document.hidden) return;
-  refreshState();
-}, 5000);
-setInterval(refreshState, 1200);
+  refreshState({ silentTimeout: true });
+}, 1200);
 refreshStorage();
 setInterval(refreshStorage, 10000);
 refreshNotebook();

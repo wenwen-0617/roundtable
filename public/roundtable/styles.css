@@ -584,12 +584,11 @@ button:hover, .button:hover {
   position: relative;
   z-index: 2;
   margin: 0 20px;
-  border: 1px solid var(--line-soft);
-  border-radius: 14px;
-  background: var(--paper-strong);
-  padding: 10px 12px;
-  display: grid;
-  gap: 8px;
+  padding: 6px 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
 }
 
 .runtime-status[hidden] {
@@ -599,17 +598,9 @@ button:hover, .button:hover {
 .runtime-status-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  color: var(--ink);
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.runtime-status-note {
+  gap: 6px;
   color: var(--muted);
   font-size: 12px;
-  line-height: 1.45;
 }
 
 .runtime-runs {
@@ -618,9 +609,6 @@ button:hover, .button:hover {
   gap: 6px;
 }
 
-.runtime-runs.recent {
-  opacity: 0.88;
-}
 
 .runtime-chip {
   display: inline-flex;
@@ -771,6 +759,19 @@ button:hover, .button:hover {
   color: var(--ink-2);
   font-family: "Noto Serif SC", serif;
   font-size: 17px;
+}
+
+.day-divider {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  margin: 2px 0;
+  padding: 3px 12px;
+  border-radius: 999px;
+  background: var(--line-soft);
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: .04em;
 }
 
 .message {
@@ -960,6 +961,124 @@ button.message-menu-button {
   display: inline-block;
   width: 1.25em;
   animation: dots 1.2s steps(4, end) infinite;
+}
+
+.message-worklog {
+  display: inline-flex;
+  align-items: center;
+  color: var(--muted);
+  font-size: 11px;
+  position: relative;
+  opacity: 0;
+  transition: opacity .15s ease;
+}
+
+.message:hover .message-worklog,
+.message-worklog:focus-within,
+.message-worklog[open] {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .message-worklog {
+    opacity: .45;
+  }
+}
+
+.message-worklog-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  list-style: none;
+  padding: 1px 6px;
+  border-radius: 8px;
+  white-space: nowrap;
+}
+
+.message-worklog-summary:hover {
+  background: var(--line-soft);
+}
+
+.message-worklog-summary::-webkit-details-marker {
+  display: none;
+}
+
+.message-worklog.active .message-worklog-summary::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--codex);
+  animation: pulse-dot 1.6s ease-in-out infinite;
+}
+
+.message-worklog.done .message-worklog-summary {
+  opacity: 0.5;
+}
+
+.message-worklog.done .message-worklog-summary:hover {
+  opacity: 0.8;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
+.message-worklog-status {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.message-worklog-events {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 10;
+  min-width: 280px;
+  width: max-content;
+  max-width: min(520px, 80vw);
+  max-height: 50vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 4px 0 0;
+  padding: 6px 8px;
+  list-style: none;
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--paper-strong);
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  box-shadow: var(--shadow-soft);
+}
+
+.message-worklog-event {
+  padding: 1px 0;
+  opacity: 0.75;
+}
+
+.message-worklog-event.warning { color: var(--claude); opacity: 1; }
+.message-worklog-event.error { color: var(--danger); opacity: 1; }
+
+.message-worklog-event.thinking {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-style: italic;
+  opacity: 0.9;
+  padding: 3px 0;
+  border-top: 1px solid var(--line-soft);
+  margin-top: 2px;
+}
+
+.message-worklog-event.thinking:first-child {
+  border-top: 0;
+  margin-top: 0;
 }
 
 @keyframes dots {
@@ -2508,18 +2627,12 @@ button.message-menu-button {
 
   .runtime-status {
     margin: 0 12px;
-    padding: 7px 9px;
-    gap: 6px;
-    border-radius: 14px;
+    padding: 4px 8px;
+    gap: 4px;
   }
 
   .runtime-status-head {
-    font-size: 12px;
-  }
-
-  .runtime-status-head small,
-  .runtime-status-note {
-    display: none;
+    font-size: 11px;
   }
 
   .runtime-runs {
@@ -4072,8 +4185,7 @@ button.message-menu-button {
   color: var(--muted);
 }
 
-.worklog-runs,
-.worklog-events {
+.worklog-runs {
   list-style: none;
   margin: 0;
   padding: 0;
@@ -4082,22 +4194,194 @@ button.message-menu-button {
   gap: 6px;
 }
 
-.worklog-run,
-.worklog-events li {
+.worklog-run {
   font-size: 13px;
   padding: 8px 12px;
   border-radius: 8px;
-  background: var(--bg-soft, var(--bg));
+  background: var(--paper);
   border: 1px solid var(--line-soft);
-  color: var(--text);
+  color: var(--ink-2);
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
-.worklog-run.interrupted,
-.worklog-run.failed {
-  border-color: var(--error-line, #e0a0a0);
-  color: var(--error-text, #c04040);
+.worklog-run.active {
+  border-color: var(--codex);
+  background: var(--codex-dim);
 }
 
-.worklog-run.completed {
-  opacity: 0.75;
+.worklog-run strong {
+  color: var(--ink);
+}
+
+.worklog-run-status {
+  color: var(--muted);
+}
+
+.worklog-run time {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.worklog-days {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.worklog-day {
+  border-top: 1px solid var(--line-soft);
+  padding-top: 10px;
+}
+
+.worklog-day:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.worklog-day-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  cursor: pointer;
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 650;
+  list-style: none;
+}
+
+.worklog-day-summary::-webkit-details-marker {
+  display: none;
+}
+
+.worklog-day-summary::before {
+  content: "▸";
+  color: var(--muted);
+  font-size: 11px;
+  transform: translateY(-1px);
+}
+
+.worklog-day[open] > .worklog-day-summary::before {
+  content: "▾";
+}
+
+.worklog-day-summary small {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.worklog-topic {
+  margin: 12px 0 0 20px;
+}
+
+.worklog-topic h4 {
+  margin: 0 0 6px;
+  color: var(--ink-2);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.worklog-timeline {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.worklog-timeline-item {
+  font-size: 13px;
+  padding: 5px 12px;
+  border-left: 2px solid var(--line-soft);
+}
+
+.worklog-timeline-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.worklog-timeline-row time {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  min-width: 52px;
+}
+
+.worklog-timeline-row strong {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+
+.worklog-timeline-row span {
+  color: var(--ink-2);
+}
+
+.worklog-timeline-item.warning {
+  border-left-color: var(--claude);
+}
+
+.worklog-timeline-item.error {
+  border-left-color: var(--danger);
+  color: var(--danger);
+}
+
+.worklog-run.warning {
+  border-color: var(--claude);
+  background: var(--claude-dim);
+}
+
+.worklog-more {
+  margin: 8px 0 2px 12px;
+  padding: 3px 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.worklog-more:hover {
+  color: var(--ink);
+  text-decoration: underline;
+}
+
+.worklog-detail-blocks {
+  margin: 6px 0 2px 60px;
+  display: grid;
+  gap: 6px;
+}
+
+.worklog-detail {
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: rgba(255,255,255,.45);
+  overflow: hidden;
+}
+
+.worklog-detail summary {
+  cursor: pointer;
+  padding: 6px 9px;
+  color: var(--ink-2);
+  font-size: 12px;
+}
+
+.worklog-detail pre {
+  max-height: 360px;
+  overflow: auto;
+  margin: 0;
+  padding: 9px;
+  border-top: 1px solid var(--line-soft);
+  color: var(--ink);
+  font: 11px/1.55 "Fira Code", ui-monospace, SFMono-Regular, Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: rgba(255,253,248,.72);
 }

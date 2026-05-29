@@ -140,7 +140,7 @@ function createCodexRuntimeAdapter(config) {
       const result = await completion;
       return { threadId, ...result };
     },
-    async sendTextTurn({ bindingKey, workspaceRoot, text, attachments = [], metadata = {}, model = "", accessMode = "", allowCreateThread = true }) {
+    async sendTextTurn({ bindingKey, workspaceRoot, text, attachments = [], metadata = {}, model = "", effort = "", accessMode = "", allowCreateThread = true }) {
       const runtimeClient = ensureClient();
       await this.initialize();
 
@@ -180,6 +180,7 @@ function createCodexRuntimeAdapter(config) {
         text: outboundText,
         attachments,
         model,
+        effort,
         accessMode,
         workspaceRoot,
       });
